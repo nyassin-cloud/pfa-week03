@@ -1,0 +1,2 @@
+I also created a second Maya tool called Creature Workbench. The idea was to make one tool that helps with multiple steps that usually have to be done separately when preparing a creature for animation.
+The user can start with a creature mesh and use the tool for retopology, UVs, creating a rig, binding the mesh, transferring skin weights.
