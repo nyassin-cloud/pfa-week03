@@ -1,2 +1,1867 @@
 I also created a second Maya tool called Creature Workbench. The idea was to make one tool that helps with multiple steps that usually have to be done separately when preparing a creature for animation.
 The user can start with a creature mesh and use the tool for retopology, UVs, creating a rig, binding the mesh, transferring skin weights.
+Does not work like how Intended it to but will still experiment with it.
+Script:
+
+
+"""Creature Workbench for Maya -- complete single-file edition, v1.1.0.
+
+AI-assisted implementation developed with OpenAI Codex.
+Requires Autodesk Maya with Python 3; not a standalone desktop application.
+
+USAGE
+  Drag this .py file into Maya's viewport, or execute it in Script Editor's
+  Python tab. The whole implementation is below; no sibling modules required.
+
+SCOPE AND VERIFICATION
+  Guided help, native retopology, original procedural head topology, landmark
+  fitting, basic creature rigs, skin transfer, UV workflows and diagnostics.
+  The original head is a construction template, not a production facial rig.
+  30 host-independent tests passed for the modular source. Maya runtime/UI
+  and paid-plugin integration have NOT been tested in the build environment.
+  Human fitting requires centimeter working units. Inspect deformation before
+  describing any generated mesh as animation-ready.
+
+PROVENANCE
+  No third-party mesh, learned weights or vendor algorithm is bundled.
+  The procedural head and fitting implementation were authored for this tool.
+  Optional paid tools must be installed/licensed separately.
+
+Readable sections retain the original comments. Repeated standard imports are
+intentional. The final entry points launch the GUI without external tool files.
+"""
+
+
+# ============================================================================
+# SECTION: creature_core.py
+# ============================================================================
+"""Host-independent guide generation and UV measurements. Y up, +Z forward."""
+import math
+import re
+
+PRESETS = {"Human / biped": 1, "Quadruped": 2, "Hexapod": 3,
+           "Octopod / spider": 4, "Winged quadruped": 2,
+           "Serpentine": 0, "Custom multi-leg": 4}
+
+
+def safe_name(value):
+    value = re.sub(r"[^A-Za-z0-9_]", "_", value.strip()) or "Creature"
+    return ("C_" + value) if value[0].isdigit() else value
+
+
+def guide_spec(preset, bounds, pairs=4, spine_count=4, tail_count=5, digits=0):
+    """Return ordered joints with parent keys. These are templates, not anatomy detection."""
+    if preset not in PRESETS:
+        raise ValueError("Unknown creature preset")
+    if len(bounds) != 6 or not all(math.isfinite(v) for v in bounds):
+        raise ValueError("Invalid bounding box")
+    lo, hi = bounds[:3], bounds[3:]
+    if any(hi[i] <= lo[i] for i in range(3)):
+        raise ValueError("Mesh needs nonzero volume in all three axes")
+    spine_count, tail_count, digits = int(spine_count), int(tail_count), int(digits)
+    if not 2 <= spine_count <= 16 or not 0 <= tail_count <= 32 or not 0 <= digits <= 5:
+        raise ValueError("Guide counts out of range")
+    pairs = int(pairs) if preset == "Custom multi-leg" else PRESETS[preset]
+    if not 0 <= pairs <= 12:
+        raise ValueError("Leg pairs must be 0..12")
+    cx = (lo[0] + hi[0]) / 2
+    w, h, d = [hi[i] - lo[i] for i in range(3)]
+    def p(x, y, z):
+        return [cx + x*w, lo[1] + y*h, lo[2] + z*d]
+    out = []
+    def add(key, parent, pos, chain="body", role="fk"):
+        out.append(dict(key=key, parent=parent, position=pos, chain=chain, role=role))
+        return key
+    human = preset == "Human / biped"
+    root = add("pelvis", None, p(0, .52 if human else .58, .48 if human else .25))
+    parent = root
+    for i in range(1, spine_count):
+        t = i/(spine_count-1)
+        parent = add("spine_%02d" % i, parent,
+                     p(0, .52+.29*t if human else .58, .48 if human else .25+.48*t))
+    chest = parent
+    neck = add("neck", chest, p(0, .86 if human else .72, .5 if human else .84))
+    head = add("head", neck, p(0, .94 if human else .8, .52 if human else .93))
+    add("head_tip", head, p(0, .99 if human else .8, .55 if human else 1), role="end")
+    for pair in range(pairs):
+        t = pair/max(1, pairs-1)
+        attach = root if pair == 0 else chest
+        z = .5 if human else .25+.48*t
+        for sign, side in [(1, "L"), (-1, "R")]:
+            chain = "leg_%02d_%s" % (pair+1, side)
+            a = add(chain+"_upper", attach, p(sign*.13, .5 if human else .57, z), chain, "ik_start")
+            b = add(chain+"_lower", a, p(sign*(.14 if human else .35), .28, z+.10), chain, "ik_mid")
+            c = add(chain+"_ankle", b, p(sign*(.14 if human else .46), .06, z), chain, "ik_end")
+            add(chain+"_toe", c, p(sign*(.14 if human else .46), .02, min(.99,z+.13)), chain, "end")
+    if human:
+        for sign, side in [(1,"L"),(-1,"R")]:
+            chain = "arm_"+side
+            a = add(chain+"_upper", chest, p(sign*.13,.8,.48), chain)
+            b = add(chain+"_lower", a, p(sign*.30,.79,.44), chain)
+            hand = add(chain+"_hand", b, p(sign*.43,.78,.48), chain)
+            for digit in range(digits):
+                parent = hand
+                for j in range(3):
+                    parent = add("finger_%d_%d_%s" % (digit+1,j+1,side), parent,
+                                 p(sign*(.45+j*.02),.78,(.30+digit*.09)), chain)
+    if preset == "Winged quadruped":
+        for sign, side in [(1,"L"),(-1,"R")]:
+            parent = chest
+            for i in range(3):
+                parent = add("wing_%d_%s" % (i+1,side), parent,
+                             p(sign*(.13+i*.18),.7+i*.12,.7-i*.14), "wing_"+side)
+    parent = root
+    for i in range(tail_count):
+        t = (i+1)/max(1,tail_count)
+        parent = add("tail_%02d" % (i+1), parent,
+                     p(0,.55-.25*t,.25-.45*t), "tail")
+    return out
+
+
+def pole_position(a, b, c, distance):
+    ab = [b[i]-a[i] for i in range(3)]
+    ac = [c[i]-a[i] for i in range(3)]
+    norm = sum(v*v for v in ac)
+    if norm < 1e-16:
+        raise ValueError("Limb endpoints overlap")
+    projection = sum(ab[i]*ac[i] for i in range(3))/norm
+    direction = [ab[i]-projection*ac[i] for i in range(3)]
+    length = math.sqrt(sum(v*v for v in direction))
+    if length < 1e-8:
+        raise ValueError("Bend the middle limb guide slightly before building IK")
+    return [b[i]+direction[i]*distance/length for i in range(3)]
+
+
+def uv_area(points):
+    return .5*sum(points[i][0]*points[(i+1)%len(points)][1]
+                   - points[(i+1)%len(points)][0]*points[i][1] for i in range(len(points)))
+
+
+def validate_spec(spec):
+    seen = set()
+    for entry in spec:
+        if entry["key"] in seen or (entry["parent"] is not None and entry["parent"] not in seen):
+            raise ValueError("Guide hierarchy is not an ordered tree")
+        if len(entry["position"]) != 3 or not all(math.isfinite(v) for v in entry["position"]):
+            raise ValueError("Invalid guide position")
+        seen.add(entry["key"])
+    if not spec or sum(x["parent"] is None for x in spec) != 1:
+        raise ValueError("Exactly one root required")
+    return True
+
+
+# ============================================================================
+# SECTION: retopo_fit.py
+# ============================================================================
+"""Original host-independent topology-preserving fitting algorithms.
+
+No meshes, learned weights, vendor code or third-party implementation are used.
+"""
+import math
+
+
+def distance(a, b):
+    return math.sqrt(sum((a[i]-b[i])**2 for i in range(3)))
+
+
+def solve(matrix, rhs):
+    """Dense linear solve with scaled coordinates and partial pivoting; multiple RHS."""
+    n = len(matrix)
+    a = [list(matrix[i])+list(rhs[i]) for i in range(n)]
+    width = len(rhs[0])
+    for col in range(n):
+        pivot = max(range(col,n), key=lambda row:abs(a[row][col]))
+        if abs(a[pivot][col]) < 1e-11:
+            raise ValueError("Landmarks are coplanar or poorly distributed. Add points on the back and sides.")
+        a[col],a[pivot] = a[pivot],a[col]
+        factor = a[col][col]
+        for j in range(col,n+width): a[col][j] /= factor
+        for row in range(n):
+            if row == col: continue
+            factor = a[row][col]
+            for j in range(col,n+width): a[row][j] -= factor*a[col][j]
+    return [row[n:] for row in a]
+
+
+class LandmarkWarp:
+    """3D radial basis displacement with an affine polynomial component.
+
+    Uses phi(r)=r, solves original mathematical equations directly. Connectivity
+    never changes. This does not guarantee injectivity or prevent foldovers.
+    """
+    def __init__(self, source, target, regularization=1e-8):
+        if len(source)!=len(target) or len(source)<6 or len(source)>128:
+            raise ValueError("Use 6–128 paired landmarks")
+        if any(len(p)!=3 or not all(math.isfinite(x) for x in p) for p in source+target):
+            raise ValueError("Landmarks must be finite 3D coordinates")
+        self.center = [sum(p[i] for p in source)/len(source) for i in range(3)]
+        self.scale = max(distance(p,self.center) for p in source)
+        if self.scale < 1e-9: raise ValueError("Landmarks occupy a single point")
+        self.anchors = [[(p[i]-self.center[i])/self.scale for i in range(3)] for p in source]
+        n = len(source)
+        if any(distance(self.anchors[i],self.anchors[j])<1e-6 for i in range(n) for j in range(i)):
+            raise ValueError("Two landmarks use the same template position; choose distinct vertices")
+        matrix = [[0.0]*(n+4) for _ in range(n+4)]
+        rhs = [[0.0]*3 for _ in range(n+4)]
+        for i,p in enumerate(self.anchors):
+            for j,q in enumerate(self.anchors): matrix[i][j] = distance(p,q)
+            matrix[i][i] += regularization
+            for k,value in enumerate([1.0]+p):
+                matrix[i][n+k] = matrix[n+k][i] = value
+            rhs[i] = [(target[i][k]-source[i][k])/self.scale for k in range(3)]
+        self.weights = solve(matrix,rhs)
+
+    def point(self,p):
+        q = [(p[i]-self.center[i])/self.scale for i in range(3)]
+        basis = [distance(q,a) for a in self.anchors]+[1.0]+q
+        return [p[k]+self.scale*sum(b*self.weights[i][k] for i,b in enumerate(basis)) for k in range(3)]
+
+
+def adjacency(vertex_count, faces):
+    result = [set() for _ in range(vertex_count)]
+    for face in faces:
+        for i,a in enumerate(face):
+            b = face[(i+1)%len(face)]
+            result[a].add(b); result[b].add(a)
+    return result
+
+
+def protected_band(vertex_count, faces, seeds, rings=2):
+    graph = adjacency(vertex_count,faces)
+    protected = set(seeds)
+    if any(v<0 or v>=vertex_count for v in protected): raise ValueError("Invalid protected vertex")
+    frontier = set(protected)
+    for _ in range(rings):
+        frontier = {j for i in frontier for j in graph[i]}-protected
+        protected.update(frontier)
+    return protected
+
+
+def bounded_step(start, goal, maximum):
+    if not math.isfinite(maximum) or maximum<0: raise ValueError("Step limit must be nonnegative")
+    delta = distance(start,goal)
+    scale = min(1.0,maximum/delta) if delta else 0
+    return [start[i]+(goal[i]-start[i])*scale for i in range(3)]
+
+
+def loop_patch(left, right, upper, lower, segments=16, rings=4, expansion=.7):
+    """Original quad annulus from four landmarks. A scaffold, not a finished face.
+
+    Parameter directions: angle 0=right, pi/2=upper, pi=left, 3pi/2=lower.
+    Ring zero is the opening. Upper and lower curves meet at the corners.
+    """
+    if segments<8 or segments%4 or not 2<=rings<=12:
+        raise ValueError("Use a multiple of four segments (at least 8) and 2–12 rings")
+    center = [(left[i]+right[i])/2 for i in range(3)]
+    axis = [(right[i]-left[i])/2 for i in range(3)]
+    if distance(left,right)<1e-8 or distance(upper,lower)<1e-8:
+        raise ValueError("Opening landmarks must be distinct")
+    vertices=[]
+    for row in range(rings):
+        scale=1+expansion*row/(rings-1)
+        for col in range(segments):
+            angle=2*math.pi*col/segments
+            vertical = upper if math.sin(angle)>=0 else lower
+            v=[vertical[i]-center[i] for i in range(3)]
+            vertices.append([center[i]+scale*(axis[i]*math.cos(angle)+v[i]*abs(math.sin(angle))) for i in range(3)])
+    faces=[]
+    for row in range(rings-1):
+        for col in range(segments):
+            nxt=(col+1)%segments
+            faces.append([row*segments+col,(row+1)*segments+col,(row+1)*segments+nxt,row*segments+nxt])
+    return vertices,faces
+
+
+# ============================================================================
+# SECTION: original_head.py
+# ============================================================================
+"""Original procedural head topology, authored for this tool. No external asset.
+
+This is a neutral construction template with deliberate eye/lip rings. It is
+not a sculpted production head, a facial rig, or deformation-certified geometry.
+"""
+import math
+
+
+def make_head(ring_rows=4):
+    if not isinstance(ring_rows,int) or not 2<=ring_rows<=12:
+        raise ValueError("Use 2–12 facial ring rows")
+    n=16
+    verts=[]; faces=[]; grid={}; uvcoord={}
+    def position(u,v,z=1):
+        length=math.sqrt(u*u+v*v+z*z)
+        jaw=1-.14*max(0,-v)
+        x=.82*u/length*jaw
+        y=1.1*v/length
+        depth=.76*z/length
+        if z>0:
+            depth+=.22*math.exp(-(u/.18)**2-((v-.06)/.25)**2)
+        return [x,y,depth]
+    def add(p):
+        verts.append(p); return len(verts)-1
+    def perimeter(x0,y0,x1,y1):
+        return ([(x,y0) for x in range(x0,x1)]+[(x1,y) for y in range(y0,y1)]
+                +[(x,y1) for x in range(x1,x0,-1)]+[(x0,y) for y in range(y1,y0,-1)])
+    holes={"eye_R":(2,10,6,13),"eye_L":(10,10,14,13),"mouth":(5,4,11,6)}
+    for j in range(n+1):
+        for i in range(n+1):
+            if any(x0<i<x1 and y0<j<y1 for x0,y0,x1,y1 in holes.values()): continue
+            u,v=2*i/n-1,2*j/n-1
+            grid[i,j]=add(position(u,v)); uvcoord[i,j]=(u,v)
+    for j in range(n):
+        for i in range(n):
+            if any(x0<=i<x1 and y0<=j<y1 for x0,y0,x1,y1 in holes.values()): continue
+            faces.append([grid[i,j],grid[i+1,j],grid[i+1,j+1],grid[i,j+1]])
+    rings={}
+    landmarks={}
+    for name,(x0,y0,x1,y1) in holes.items():
+        loop=perimeter(x0,y0,x1,y1)
+        outer=[grid[p] for p in loop]
+        cx,cy=(x0+x1)/2,(y0+y1)/2
+        hx,hy=(x1-x0)/2,(y1-y0)/2
+        angles=[math.atan2((j-cy)/hy,(i-cx)/hx) for i,j in loop]
+        rings[name]=[outer]
+        for row in range(1,ring_rows+1):
+            t=row/ring_rows
+            current=[]
+            for (i,j),angle in zip(loop,angles):
+                # Interpolate a rectangle perimeter into an elliptical opening.
+                endx=cx+hx*.72*math.cos(angle)
+                endy=cy+hy*(.45 if name=="mouth" else .56)*math.sin(angle)
+                u=2*((1-t)*i+t*endx)/n-1
+                v=2*((1-t)*j+t*endy)/n-1
+                current.append(add(position(u,v)))
+            for k in range(len(outer)):
+                nxt=(k+1)%len(outer)
+                faces.append([outer[k],outer[nxt],current[nxt],current[k]])
+            rings[name].append(current)
+            outer=current
+        points=[verts[i] for i in outer]
+        right=outer[max(range(len(outer)),key=lambda k:points[k][0])]
+        left=outer[min(range(len(outer)),key=lambda k:points[k][0])]
+        upper=outer[max(range(len(outer)),key=lambda k:points[k][1])]
+        lower=outer[min(range(len(outer)),key=lambda k:points[k][1])]
+        if name=="mouth":
+            landmarks.update(mouth_L=right,mouth_R=left,mouth_upper=upper,mouth_lower=lower)
+        else:
+            landmarks[name+"_inner"]=left if name=="eye_L" else right
+            landmarks[name+"_outer"]=right if name=="eye_L" else left
+            landmarks[name+"_upper"]=upper; landmarks[name+"_lower"]=lower
+        # Inset rim provides depth; remains open. No eyeball or mouth bag supplied.
+        inset=[add([verts[idx][0],verts[idx][1],verts[idx][2]-.035]) for idx in outer]
+        for k in range(len(outer)):
+            nxt=(k+1)%len(outer)
+            faces.append([outer[k],outer[nxt],inset[nxt],inset[k]])
+        rings[name].append(inset)
+    boundary=perimeter(0,0,n,n)
+    front=[grid[p] for p in boundary]
+    side_loops=[]
+    for z in (.33,-.33,-1):
+        back=[add(position(2*i/n-1,2*j/n-1,z)) for i,j in boundary]
+        for k in range(len(front)):
+            nxt=(k+1)%len(front)
+            # Opposite winding to front patch along the shared edge.
+            faces.append([front[nxt],front[k],back[k],back[nxt]])
+        front=back; side_loops.append(back)
+    backgrid=dict(zip(boundary,front))
+    for j in range(1,n):
+        for i in range(1,n): backgrid[i,j]=add(position(2*i/n-1,2*j/n-1,-1))
+    for j in range(n):
+        for i in range(n):
+            faces.append([backgrid[i,j+1],backgrid[i+1,j+1],backgrid[i+1,j],backgrid[i,j]])
+    landmarks.update(nose_tip=grid[8,9],nose_base=grid[8,7],chin=grid[8,1],forehead=grid[8,15],
+                     head_back=backgrid[8,8],jaw_L=grid[15,3],jaw_R=grid[1,3])
+    for side,x in (("L",n),("R",0)):
+        landmarks["ear_"+side]=side_loops[0][boundary.index((x,8))]
+    return verts,faces,landmarks,rings
+
+
+def obj_text(vertices,faces):
+    lines=["# Original procedural Creature Workbench head. Construction template, not certified for animation."]
+    lines += ["v %.9g %.9g %.9g" % tuple(p) for p in vertices]
+    lines += ["f "+" ".join(str(i+1) for i in face) for face in faces]
+    return "\n".join(lines)+"\n"
+
+
+# ============================================================================
+# SECTION: workbench_help.py
+# ============================================================================
+"""Original user-facing instructions shared by tooltips and the in-window help panel."""
+
+PAGES = {
+"Start here": "START HERE\n1. Select your original mesh and click Set source. Source means the shape you want to match.\n2. For a human head, open Human topology and create the original head template, then capture matching Source landmarks. For a full body, supply a compatible animation-topology mesh you own. Fitting preserves its eye, lip and joint loops.\n3. Generic remeshing is available for other shapes but does not design anatomical loops.\n4. Check the fitted mesh, make UVs, then rig/bind it. Every button has a ? explanation; right-click a setting for help. No third-party mesh is bundled.",
+"Free / Built-in": "FREE / BUILT-IN\nSet Source to the original high-resolution shape. Analyze it before processing. Put a rigged source in its intended rest pose and tick the rest-pose box. A working snapshot is a separate editable copy. Source is retained. Free means no additional purchase beyond Maya.",
+"Paid / Optional": "PAID / OPTIONAL\nOnly for tools you choose to install and license. Detection is not a license check. Quad Remesher is a vendor-UI handoff: select your working mesh, use its shelf, then adopt the output with Set working mesh. ngSkinTools opens its own UI. No paid asset or vendor implementation is included.",
+"Retopology": "GENERIC RETOPOLOGY\nThis remesher redistributes polygons around shape features. It does not know eyelids, lip closure or muscle motion. For human animation use Human topology to preserve a suitable template's connectivity. Start with 8,000 faces for a rough test, inspect the result, then adjust the budget. More quads alone do not improve deformation flow.",
+"Human topology": "HUMAN / FACE TOPOLOGY\nSource is the sculpt; Template supplies the connectivity. Both must have compatible anatomy and pose.\n1. Create our original HEAD-ONLY template (21 landmarks prefilled), or supply/align a mesh you own for full-body work.\n2. Choose a named landmark. If not prefilled, capture one Template vertex. Then capture one matching Source vertex. Include sides/back as well as facial features. At least six non-coplanar pairs; use many more for a face.\n3. Fit preserves the Template's faces and vertex order.\n4. Bounded surface fitting excludes protected areas such as lids/lip seams.\n5. Test expressions and bends before declaring it ready. The original head has 888 quads, three open apertures and simple rims; no detailed ears, nostril holes, neck opening or mouth cavity. No facial rig is generated.",
+"Creature Rig": "CREATURE RIG\nChoose a body plan, create locator guides, and move each guide to its joint center. Build creates a new skeleton and controls from those positions. Bind attaches the working mesh to that rig. Existing source rigs instead use Transfer skin. FK rotates joint chains; IK moves a foot target and uses a pole to set knee direction. This is a basic rig, without facial controls.",
+"Automatic UVs": "AUTOMATIC UVs\nUVs are a flat texture layout of the surface. Use existing seams when you have deliberate cuts. Automatic projection makes a starting layout but often many shells. Unfold reduces distortion; Pack arranges shells. UV generation makes an unskinned copy, so do this before binding. View a checker and inspect overlap in Maya's UV Editor.",
+"Validate / Help": "VALIDATION\nGeometry checks find numerical/topological defects. UV checks find missing or collapsed coordinates. Skin checks find weight sums and influence-count issues. None of these alone certifies a face for animation. Test blinking, lip closure, jaw opening, shoulders, elbows and hips on your actual character. Reports can be saved as JSON.",
+}
+
+SETTINGS = {
+"rest": "WHAT: acknowledgement that the Source is in its intended bind/rest pose.\nHOW: restore the pose in your rig, verify it visually, then tick this box. Reset whenever Source changes. A posed snapshot will not correctly transfer bind-pose skin weights.",
+"faces": "WHAT: requested polygon budget for generic remeshing.\nHOW: start around 8,000 for a small body test, then inspect silhouette/detail. It is approximate. This setting is not used by Human topology because that mode preserves the template's face count.",
+"tolerance": "WHAT: permitted variation around the requested face count.\nHOW: 15% gives the solver flexibility. Smaller values may take longer; exact counts are not guaranteed.",
+"regularity": "WHAT: generic solver tradeoff between regular topology and detail.\nHOW: begin at 0.5 and compare outputs. This is not a facial-loop setting.",
+"uniformity": "WHAT: similarity of polygon sizes.\nHOW: low values adapt density to detail; high values favor equal sizes and may undersample facial features.",
+"anisotropy": "WHAT: tendency toward elongated quads on curved regions.\nHOW: start at 0.5. Inspect joints and curved surfaces after changing it.",
+"hard": "WHAT: preserve intentionally hardened edges as remeshing features.\nHOW: harden selected edges on a working copy, adopt it as Source, then remesh. Existing shading splits can also affect the result.",
+"project": "WHAT: project the generic output to the nearest source surface.\nHOW: leave off for close lips/fingers or thin surfaces until alignment is good. Nearest geometry can be the wrong anatomical surface.",
+"prefix": "WHAT: name prefix for generated guides and rig nodes.\nHOW: type a short character name. Invalid name characters are replaced automatically.",
+"species": "WHAT: starting guide layout, not anatomy recognition.\nHOW: choose the closest body plan, then fit every guide in the viewport. Templates assume Y up and +Z forward.",
+"pairs": "WHAT: leg-pair count for Custom multi-leg only.\nHOW: 4 means eight legs. Other presets use their own fixed pair count.",
+"spine": "WHAT: number of axial torso joints in the guide template.\nHOW: more joints allow finer bending but need more controls/weight refinement.",
+"tail": "WHAT: tail chain length.\nHOW: set 0 for no tail, then place remaining guides if required. Human characters usually need 0.",
+"digits": "WHAT: finger chains per hand for the biped preset.\nHOW: 5 creates placeholders for a hand. Fit the thumb and every phalanx yourself; this does not detect fingers.",
+"chain_count": "WHAT: number of guides for the next extra chain.\nHOW: select a guide in the active guide group, then Add chain. Move the new guides onto the appendage.",
+"rigmode": "WHAT: fixed control mode for the next rig build.\nHOW: FK everywhere for direct rotations, or IK legs + FK body for foot targets. Knees must be bent. There is no live FK/IK switching.",
+"influences": "WHAT: desired maximum bone contributions per vertex when binding.\nHOW: 4 is a common starting limit. Transfer may exceed it; Audit skin reports excess weights.",
+"skinmethod": "WHAT: deformation formula.\nHOW: linear is conventional; dual quaternion can retain twist volume but may bulge. Compare actual bend poses.",
+"uvmode": "WHAT: initial UV layout.\nHOW: Keep existing seams uses your current UV cuts. Automatic projection creates a new starting layout with more fragments.",
+"planes": "WHAT: number of projection directions used in Automatic projection.\nHOW: start at 6. More directions may reduce local distortion but create more shells.",
+"unwrap": "WHAT: flattening method.\nHOW: Unfold3D requires its installed Maya plugin. Legacy is an explicit alternative. Pack only arranges the existing layout without unfolding.",
+"iterations": "WHAT: maximum iterations for Legacy Maya unfold only.\nHOW: start at 100; increase if it is still improving. This does not affect Unfold3D.",
+"padding": "WHAT: Maya's percentage space around UV shells.\nHOW: start at 0.5%. It is not exact pixels; verify gutters at your final texture resolution.",
+"rotation": "WHAT: rotations the packer may use.\nHOW: Free usually packs more flexibly; None preserves current orientation.",
+"tile": "WHAT: one destination UDIM tile.\nHOW: 1001 is the first tile, 1002 the next to the right. This moves one packed tile, not an automatic multi-tile layout.",
+"fit_landmark": "WHAT: named anatomical correspondence.\nHOW: select a template vertex at this feature and capture it; select the corresponding Source vertex and capture it. Left/Right refer to character sides, consistently for both meshes.",
+"fit_steps": "WHAT: refinement passes for the optional surface fit.\nHOW: start at 1–3. The landmark warp itself has no iteration control. More passes can accumulate movement, so inspect after each run.",
+"fit_distance": "WHAT: maximum vertex movement per surface-fit pass, as a percent of template height.\nHOW: start at 0.2%. Large values increase the risk of crossing lips, eyelids or fingers.",
+"fit_band": "WHAT: neighbor rings to protect around marked vertices during surface fitting.\nHOW: 2 keeps a small topological neighborhood from projecting. It does not protect against the initial landmark warp.",
+"patch_segments": "WHAT: vertex count around each original loop patch.\nHOW: multiples of four are required, e.g. 16. This affects only the optional patch scaffold, not template fitting.",
+"patch_rings": "WHAT: concentric rows in an eye/lip quad patch.\nHOW: start at 4. A patch is open at both boundaries and must be joined into a complete face before rigging.",
+}
+
+ACTIONS = {
+"set_source": "Select ONE original polygon mesh, then click. Source is the shape to match and is retained. For a face-only target, use a face/head-only template too.",
+"set_target": "Select one separate output mesh to make it the working mesh. UV, bind and diagnostic tools use this object. It cannot also be Source.",
+"make_working": "After verifying the rest pose, click to duplicate the evaluated Source into an independent, unskinned working mesh. Source modifiers/rig remain on Source.",
+"detect": "Lists Maya modules, loaded plugins and optional Python modules in the log. Missing detection does not prove a MEL-only tool is absent; detection does not check licenses.",
+"open_ngskin": "Opens the documented ngSkinTools 2 interface if installed. Use that interface to edit weights/layers. This tool does not install or purchase it.",
+"export_obj": "Exports only the working mesh to an OBJ file you choose. This is geometry exchange, not a rig export. Verify units and axes in the receiving app.",
+"import_obj": "Imports an OBJ as new objects in a new namespace. A single imported mesh becomes working mesh. Inspect its scale, topology and UVs first.",
+"retopo": "Creates a new mesh using Maya's generic Retopologize solver. It uses Source and the retopology settings, not the human template. It cannot guarantee animation loops. Choose Human topology for an existing loop layout.",
+"harden_edges": "Select edges on the WORKING mesh, then click. This makes shading edges hard so the generic solver can preserve them. Adopt that copy as Source before remeshing again.",
+"project_copy": "Creates an unskinned copy of working mesh and moves it toward Source using nearest-surface transfer. Close surfaces can be confused. Human topology offers bounded, protected refinement instead.",
+"deviation": "Measures at most about 500 working vertices against Source. Smaller distance means closer sampled shape, not better animation loops. It is not a full surface-error guarantee.",
+"create_guides": "Creates a new set of locator guides around the working mesh bounds. Move each guide to the correct joint location. Guides are not a finished rig.",
+"use_guides": "Select the top generated guide group in Outliner and click. Useful after reopening the window. This does not alter the guides.",
+"mirror_guides": "Copies left guide positions to the right across the pelvis world-X plane. Fit the left side first. Asymmetrical characters may need individual corrections.",
+"add_chain": "Select a locator in the active guide group. Adds a new FK chain parented to that guide; position it for a tentacle, extra wing branch or other appendage.",
+"build_rig": "Builds a NEW skeleton and controls from fitted guides. Previous rigs remain. Verify knee bends for IK. Guide edits after building require another build; they do not update old rigs.",
+"use_rig": "Select a generated rig group and click to use it for binding/control selection. Does not recognize arbitrary third-party rigs; use source skin transfer for those.",
+"bind_rig": "Attaches an unskinned working mesh to the generated skeleton with initial weights. Existing skin is not overwritten. Pose-test and refine weights afterward.",
+"transfer_skin": "Source must be skinned and in the verified bind pose. Binds the unskinned working mesh to the SAME source joints and copies weights. Does not copy facial blendshapes or correctives.",
+"select_controls": "Selects controls stored on the active generated rig. Rotate FK circles or move IK foot/pole controls to inspect bending. Undo or reset your poses afterward.",
+"export_guides": "Saves fitted guide positions, hierarchy and units to JSON. Does not save the mesh or a Maya scene. Use this to reuse a body plan.",
+"import_guides": "Loads a saved guide JSON as a new guide group. Scene units must match. Fit imported positions to your new character before building.",
+"uvs": "Creates a NEW UNSKINNED working copy, copies/creates a UV set, unfolds and packs it. Use before binding; otherwise transfer skin afterward. Source is retained.",
+"cut_seams": "Select edges on the working mesh to open into UV seams. Cuts UVs, not geometry. Then run Keep existing seams / UVs to unfold the layout.",
+"analyze_uv": "Reports missing UVs, collapsed faces, orientation, bounds and area-density variation in the log. Use the UV Editor to check overlaps and a checker texture for distortion.",
+"audit_skin": "Checks zero/unnormalized weights and excessive influences on working mesh. Passing this does not prove good bending or correct bone assignment.",
+"save_report": "Saves the most recent diagnostic report as JSON. Run the desired diagnostic immediately before saving.",
+"save_settings": "Saves slider/menu preferences as JSON. Does not save Source, working mesh, rest verification or scene objects.",
+"load_settings": "Loads validated preferences. You still need to assign Source/working mesh and verify the rest pose in this scene.",
+}
+
+
+def action_text(label, name):
+    if name in ACTIONS: return ACTIONS[name]
+    if "documentation" in label.lower(): return "Opens the official documentation in your browser. No scene changes or purchases. Return to Maya to continue."
+    if "UV Editor" in label: return "Opens Maya's UV Editor. Select the working mesh, display a checker and inspect overlap and seam placement."
+    if label.startswith("Analyze"): return "Reads the indicated mesh and writes defect counts to the log. Repair defects before proceeding. This does not alter the mesh or certify deformation quality."
+    if "live" in label.lower(): return "A live Source is a snapping surface for Maya Quad Draw. Enable it for manual retopology, then disable it when you finish to restore normal selection."
+    if "vendor tool" in label: return "Selects the current working mesh. Run your separately installed vendor shelf tool next, then select its result and Set working mesh."
+    return label+". Follow the numbered steps on this page. See the page guide for prerequisites and expected results."
+
+
+# ============================================================================
+# SECTION: human_retopology.py
+# ============================================================================
+"""Original Maya topology-preserving fitting UI and operations. No bundled mesh."""
+import hashlib
+import json
+import math
+import re
+import os
+import tempfile
+
+import maya.cmds as cmds
+import maya.api.OpenMaya as om
+
+LANDMARKS = [
+    "nose_tip", "nose_base", "chin", "forehead", "head_back", "ear_L", "ear_R",
+    "eye_L_inner", "eye_L_outer", "eye_L_upper", "eye_L_lower",
+    "eye_R_inner", "eye_R_outer", "eye_R_upper", "eye_R_lower",
+    "mouth_L", "mouth_R", "mouth_upper", "mouth_lower",
+    "jaw_L", "jaw_R", "neck_front", "neck_back", "shoulder_L", "shoulder_R",
+    "elbow_L", "elbow_R", "wrist_L", "wrist_R", "palm_L", "palm_R",
+    "chest", "belly", "pelvis_front", "pelvis_back", "hip_L", "hip_R",
+    "knee_L", "knee_R", "ankle_L", "ankle_R", "toe_L", "toe_R",
+] + ["extra_%02d" % i for i in range(1,17)]
+
+
+def helpers():
+    return mesh_fn,shape_of,selected_mesh,snapshot,transaction,string_attr
+
+
+def mesh_data(mesh):
+    mesh_fn,*_ = helpers()
+    fn=mesh_fn(mesh)
+    counts, indices=fn.getVertices()
+    faces=[]; cursor=0
+    for count in counts:
+        faces.append(list(indices[cursor:cursor+count])); cursor+=count
+    return fn,[[p.x,p.y,p.z] for p in fn.getPoints(om.MSpace.kWorld)],faces
+
+
+def require_fit_units():
+    # This first Maya integration is qualified for default command/API units.
+    # Do not silently rescale a user's scene or claim untested unit conversions.
+    if cmds.currentUnit(query=True,linear=True)!="cm":
+        raise ValueError("Human fitting currently requires Maya's default centimeter working units. Set Preferences > Settings > Working Units > Linear to centimeter, then retry. Scene units are not changed automatically.")
+
+
+def signature(mesh):
+    fn,_,faces=mesh_data(mesh)
+    return hashlib.sha256(json.dumps([fn.numVertices,faces],separators=(",",":")).encode()).hexdigest()
+
+
+def write_world_points(mesh, points):
+    """Undoable bulk Maya tweak update rather than non-undoable MFnMesh.setPoints."""
+    mesh_fn,shape_of,*_=helpers()
+    fn=mesh_fn(mesh)
+    if len(points)!=fn.numVertices: raise ValueError("Fitting changed vertex count unexpectedly")
+    inv=fn.dagPath().inclusiveMatrixInverse()
+    current=fn.getPoints(om.MSpace.kObject)
+    shape=shape_of(mesh)
+    # Accumulate any existing tweak rather than assuming zero.
+    offsets=cmds.getAttr(shape+".pnts[0:%d]" % (len(points)-1))
+    values=[]
+    for i,p in enumerate(points):
+        local=om.MPoint(*p)*inv
+        tweak=offsets[i] if offsets and i<len(offsets) else (0,0,0)
+        values.extend([local.x-current[i].x+tweak[0],local.y-current[i].y+tweak[1],local.z-current[i].z+tweak[2]])
+    cmds.setAttr(shape+".pnts[0:%d]" % (len(points)-1),*values,type="float3",size=len(points))
+    updated=mesh_fn(mesh).getPoints(om.MSpace.kWorld)
+    tolerance=max(1e-6,max(abs(x) for p in points for x in p)*1e-6)
+    if any(distance([a.x,a.y,a.z],b)>tolerance for a,b in zip(updated,points)):
+        raise RuntimeError("Maya vertex update did not match requested positions; operation rolled back")
+
+
+class HumanRetopology:
+    def human_tab(self):
+        self.text("Fit deliberate topology to your sculpt while keeping its loops.\nUse our original head construction template or a compatible topology mesh YOU OWN.")
+        self.button("Start with an original head topology template",self.create_original_head,True,
+                    help_text="Creates a head template generated by original code, with connected quads and concentric eye/mouth rings. No downloaded mesh. Use a HEAD-ONLY Source: this is not a full body. Template landmarks are prefilled; capture matching SOURCE vertices, then Fit. Ears are side landmarks, not detailed ear geometry. Facial deformation is not yet validated.")
+        self.button("1. Use selected mesh as my topology template", self.set_template, True,
+                    help_text="Select one unposed mesh you own with suitable face/body loops. It must be separate from Source. Source supplies the new shape; this Template supplies the edge layout. No files are downloaded.")
+        self.ui["template_label"]=cmds.text(label="Template: not set",align="left")
+        self.button("2. Make roughly aligned template copy", self.align_template,
+                    help_text="Duplicates your Template and scales it uniformly to Source height, aligning their centers. Both should be upright with matching pose/direction. Inspect and manually align limbs/head. This resets captured pairs.")
+        self.menu("fit_landmark","Match this feature",LANDMARKS)
+        self.button("Show the current template landmark",self.show_template_landmark,
+                    help_text="Selects the captured/pre-filled Template vertex for this named feature. Use it as a reference for where to place the matching Source point. It does not change geometry or camera position.")
+        self.button("3a. Capture selected TEMPLATE vertex",lambda:self.capture_landmark("template"),
+                    help_text="Right-click Template in the viewport, choose Vertex, select ONE vertex at the named feature, then click. Next capture the same anatomical feature on Source. For lips, choose distinct upper/lower points.")
+        self.button("3b. Capture matching SOURCE vertex",lambda:self.capture_landmark("source"),
+                    help_text="Select ONE vertex on Source at the matching anatomical feature, then click. Both sides of the pair are now stored. Choose another feature or press Next unmatched feature.")
+        self.button("Next unmatched feature",self.next_landmark,
+                    help_text="Selects the next named feature lacking a complete template/source pair. Skip irrelevant landmarks using the menu. Use sides and back as well as the front so pairs span three dimensions.")
+        self.button("Show landmark pair status",self.show_landmarks,
+                    help_text="Lists captured vertex pairs in the log. At least six spatially distributed pairs are required. A detailed face needs eyelid/lip corners and upper/lower points, nose, chin, sides and back.")
+        self.button("Clear current landmark pair",self.clear_landmark,
+                    help_text="Removes only the currently named correspondence from tool memory. It does not delete or alter scene vertices.")
+        self.button("4. Fit template → new working mesh",self.fit_human,True,
+                    help_text="Solves a smooth displacement from your paired features and applies it to a duplicate Template. Vertex order and faces are unchanged; UVs come from Template. Large proportion/pose differences may fold geometry. This is a fit candidate, not a deformation-certified output.")
+        self.integer("fit_band","Protected neighbor rings",2,0,8)
+        self.button("Protect selected working vertices",self.protect_fit_vertices,
+                    help_text="Select working-mesh vertices around lip seams, lids, nostrils, inside mouth, fingers or other close surfaces. Adds them and nearby vertex rings to the surface-fit exclusion mask. Fitted facial landmarks and open boundaries are protected automatically.")
+        self.button("Select protected working vertices",self.select_protected,
+                    help_text="Highlights the vertices that optional surface fitting will leave fixed. Check that all sensitive openings and interior surfaces are covered before projecting.")
+        self.integer("fit_steps","Surface-fit passes",2,1,10)
+        self.number("fit_distance","Max step / height %",.2,.01,2)
+        self.button("5. Bounded surface fit → new copy",self.refine_human,
+                    help_text="Moves unprotected vertices toward Source by a limited distance per pass. Opposite-facing or distant hits are skipped. Connectivity and protected vertices are retained. Nearest-surface matching can still confuse close anatomy; inspect each output.")
+        self.button("6. Check fitted topology",self.check_human,
+                    help_text="Checks that face connectivity still matches Template; reports missing/nonmanifold/degenerate geometry, source distance and extreme edge-length changes. It cannot certify eye closure, smiles or joint bending. You still need pose/expression review.")
+        self.text("Optional original construction helpers — these create separate open quad patches.\nThey are not merged into a complete face automatically.")
+        self.integer("patch_segments","Loop segments (multiple of 4)",16,8,64)
+        self.integer("patch_rings","Concentric loop rows",4,2,12)
+        for feature in ("eye_L","eye_R","mouth"):
+            self.button("Build original %s loop patch" % feature,
+                        lambda f=feature:self.build_loop_patch(f),
+                        help_text="Capture the four SOURCE landmarks for this opening first. Builds original concentric quad loops through those points. This is a separate scaffold requiring face connections, surface fitting and deformation inspection; it does not replace the working mesh.")
+
+    def create_original_head(self):
+        require_fit_units()
+        _,_,_,_,transaction,string_attr=helpers()
+        source=self.source()
+        vertices,faces,landmarks,_=make_head()
+        # Align authored geometry uniformly to the head-only Source bounding box.
+        box=cmds.exactWorldBoundingBox(source)
+        lo=[min(p[i] for p in vertices) for i in range(3)]
+        hi=[max(p[i] for p in vertices) for i in range(3)]
+        factor=(box[4]-box[1])/(hi[1]-lo[1])
+        if factor<=0: raise ValueError("Head Source needs nonzero height")
+        center=[(box[i]+box[i+3])/2 for i in range(3)]
+        origin=[(lo[i]+hi[i])/2 for i in range(3)]
+        aligned=[[center[i]+(p[i]-origin[i])*factor for i in range(3)] for p in vertices]
+        # OBJ is a temporary serialization of our own generated arrays, not an external asset.
+        path=None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w",suffix=".obj",delete=False,encoding="utf-8") as stream:
+                stream.write(obj_text(aligned,faces)); path=stream.name
+            with transaction("CW original head template"):
+                nodes=cmds.file(path,i=True,type="OBJ",returnNewNodes=True,ignoreVersion=True,
+                                namespace="CW_originalHead",mergeNamespacesOnClash=False)
+                shapes=cmds.ls(nodes,type="mesh",long=True) or []
+                if len(shapes)!=1: raise RuntimeError("Original template import did not produce one mesh")
+                mesh=cmds.listRelatives(shapes[0],parent=True,fullPath=True)[0]
+                _,actual,imported_faces=mesh_data(mesh)
+                if imported_faces!=faces or len(actual)!=len(aligned) or any(distance(a,b)>max(1e-5,factor*1e-5) for a,b in zip(actual,aligned)):
+                    raise RuntimeError("OBJ importer changed template order/units; cannot safely prefill landmarks")
+                string_attr(mesh,"cwOriginalAsset","Procedurally authored by Creature Workbench; no external mesh")
+                string_attr(mesh,"cwReadiness","ORIGINAL_CONSTRUCTION_TEMPLATE_NOT_DEFORMATION_VALIDATED")
+        finally:
+            if path and os.path.exists(path): os.remove(path)
+        self.remember(mesh,"template")
+        sig=signature(mesh)
+        self.fit_pairs={name:{"template":dict(index=index,uuid=self.template_uuid,signature=sig)} for name,index in landmarks.items()}
+        cmds.text(self.ui["template_label"],edit=True,label="Original head template: "+mesh.split("|")[-1])
+        cmds.select(mesh)
+        self.log("Original connected head created: %d quads. %d template landmarks prefilled. Capture matching Source landmarks; use a head-only Source. No external asset used." % (len(faces),len(landmarks)))
+
+    def set_template(self):
+        _,_,selected_mesh,_,_,_=helpers()
+        mesh=selected_mesh()
+        if cmds.ls(mesh,uuid=True)[0]==self.source_uuid:
+            raise ValueError("Template and Source must be separate objects")
+        self.remember(mesh,"template")
+        self.fit_pairs={}
+        cmds.text(self.ui["template_label"],edit=True,label="Template: "+mesh.split("|")[-1])
+        self.log("Your template assigned. Its loop quality determines the output connectivity.")
+
+    def align_template(self):
+        require_fit_units()
+        _,_,_,snapshot,transaction,_=helpers()
+        src=self.source(); template=self.resolve("template")
+        a=cmds.exactWorldBoundingBox(template); b=cmds.exactWorldBoundingBox(src)
+        if a[4]-a[1]<1e-9: raise ValueError("Template has no height")
+        factor=(b[4]-b[1])/(a[4]-a[1])
+        ca=[(a[i]+a[i+3])/2 for i in range(3)]; cb=[(b[i]+b[i+3])/2 for i in range(3)]
+        with transaction("CW align owned template"):
+            result=snapshot(template,"_alignedTemplate")
+            _,points,_=mesh_data(result)
+            write_world_points(result,[[cb[i]+(p[i]-ca[i])*factor for i in range(3)] for p in points])
+        self.remember(result,"template"); self.fit_pairs={}
+        cmds.text(self.ui["template_label"],edit=True,label="Template: "+result.split("|")[-1])
+        cmds.select(result)
+        self.log("Roughly aligned copy made. Match orientation/pose in the viewport before pairing features.")
+
+    def captured_vertex(self,slot):
+        _,shape_of,*_=helpers()
+        selected=cmds.filterExpand(cmds.ls(selection=True,long=True,flatten=True) or [],selectionMask=31) or []
+        if len(selected)!=1: raise ValueError("Select exactly ONE vertex on the "+slot+" mesh")
+        match=re.match(r"(.+)\.vtx\[(\d+)\]$",selected[0])
+        mesh=self.resolve(slot)
+        if not match or shape_of(match.group(1))!=shape_of(mesh):
+            raise ValueError("The selected vertex is not on the assigned "+slot)
+        return dict(index=int(match.group(2)),uuid=cmds.ls(mesh,uuid=True)[0],signature=signature(mesh))
+
+    def capture_landmark(self,slot):
+        label=self.value("fit_landmark","menu")
+        self.fit_pairs.setdefault(label,{})[slot]=self.captured_vertex(slot)
+        self.log(label+": captured "+slot+" vertex. "+("Pair complete." if len(self.fit_pairs[label])==2 else "Capture the matching other vertex next."))
+
+    def show_template_landmark(self):
+        label=self.value("fit_landmark","menu")
+        entry=self.fit_pairs.get(label,{}).get("template")
+        mesh=self.resolve("template")
+        if not entry: raise ValueError("Capture this template point first, or choose a prefilled point")
+        if entry["uuid"]!=self.template_uuid or entry["signature"]!=signature(mesh):
+            raise ValueError("Template changed; recapture its landmarks")
+        cmds.select(mesh+".vtx[%d]" % entry["index"],replace=True)
+        self.log("Highlighted Template "+label+". Match this feature on Source.")
+
+    def next_landmark(self):
+        current=LANDMARKS.index(self.value("fit_landmark","menu"))
+        for offset in range(1,len(LANDMARKS)+1):
+            label=LANDMARKS[(current+offset)%len(LANDMARKS)]
+            if len(self.fit_pairs.get(label,{}))<2:
+                cmds.optionMenu(self.ui["fit_landmark"],edit=True,value=label); return
+        self.log("All landmark slots have complete pairs.")
+
+    def clear_landmark(self):
+        label=self.value("fit_landmark","menu")
+        self.fit_pairs.pop(label,None); self.log("Cleared "+label)
+
+    def show_landmarks(self):
+        self.log("\n".join("%s: template %s / source %s" % (key,pair.get("template",{}).get("index","—"),pair.get("source",{}).get("index","—")) for key,pair in self.fit_pairs.items()) or "No landmarks captured yet.")
+
+    def correspondence(self,complete=True):
+        template=self.resolve("template"); source=self.source()
+        meshes={"template":template,"source":source}
+        points={slot:mesh_data(mesh)[1] for slot,mesh in meshes.items()}
+        signatures={slot:signature(mesh) for slot,mesh in meshes.items()}
+        uids={slot:cmds.ls(mesh,uuid=True)[0] for slot,mesh in meshes.items()}
+        pairs=[]
+        for label,pair in self.fit_pairs.items():
+            if complete and len(pair)!=2: continue
+            resolved={}
+            for slot,entry in pair.items():
+                if entry["uuid"]!=uids[slot] or entry["signature"]!=signatures[slot]:
+                    raise ValueError("Mesh topology/assignment changed; recapture landmarks")
+                resolved[slot]=points[slot][entry["index"]]
+            pairs.append((label,resolved,pair))
+        return pairs
+
+    def fit_human(self):
+        require_fit_units()
+        self.require_rest()
+        _,_,_,snapshot,transaction,string_attr=helpers()
+        template=self.resolve("template")
+        pairs=self.correspondence()
+        warp=LandmarkWarp([p["template"] for _,p,_ in pairs],[p["source"] for _,p,_ in pairs])
+        _,points,faces=mesh_data(template)
+        warped=[warp.point(p) for p in points]
+        if not all(math.isfinite(x) for p in warped for x in p): raise ValueError("Invalid fit; inspect landmarks")
+        seeds=[indices["template"]["index"] for label,_,indices in pairs if label.startswith(("eye_","mouth","nose_"))]
+        # Keep all open boundaries fixed during the optional subsequent projection.
+        edge_counts={}
+        for face in faces:
+            for i,a in enumerate(face):
+                edge=tuple(sorted((a,face[(i+1)%len(face)])))
+                edge_counts[edge]=edge_counts.get(edge,0)+1
+        seeds+=list({i for edge,count in edge_counts.items() if count==1 for i in edge})
+        protected=sorted(protected_band(len(points),faces,seeds,self.value("fit_band")))
+        with transaction("CW human topology fit"):
+            result=snapshot(template,"_humanFit")
+            write_world_points(result,warped)
+            string_attr(result,"cwFitSignature",signature(template))
+            string_attr(result,"cwFitProtected",json.dumps(protected))
+            string_attr(result,"cwFitSourceUUID",self.source_uuid)
+            string_attr(result,"cwFitLandmarks",json.dumps({label:idx["template"]["index"] for label,_,idx in pairs}))
+            string_attr(result,"cwReadiness","UNREVIEWED_FIT")
+        self.remember(result,"target"); cmds.select(result)
+        self.log("Human fit created: %d vertices, %d faces; template connectivity preserved. Inspect lips, lids, fingers and joint loops before rigging." % (len(points),len(faces)))
+
+    def fit_protected(self,mesh):
+        if not cmds.attributeQuery("cwFitSignature",node=mesh,exists=True):
+            raise ValueError("Use a Human topology fitted output first")
+        if cmds.getAttr(mesh+".cwFitSignature")!=signature(mesh):
+            raise ValueError("Output topology changed; protected vertex IDs are no longer valid")
+        if cmds.getAttr(mesh+".cwFitSourceUUID")!=self.source_uuid:
+            raise ValueError("Source changed since fitting. Restore the original Source or create a new fit")
+        return set(json.loads(cmds.getAttr(mesh+".cwFitProtected")))
+
+    def protect_fit_vertices(self):
+        _,shape_of,_,_,transaction,string_attr=helpers()
+        mesh=self.target(); protected=self.fit_protected(mesh)
+        selected=cmds.filterExpand(cmds.ls(selection=True,long=True,flatten=True) or [],selectionMask=31) or []
+        if not selected: raise ValueError("Select working-mesh vertices to protect")
+        seeds=[]
+        for item in selected:
+            node,index=item.split(".vtx[")
+            if shape_of(node)!=shape_of(mesh): raise ValueError("Select vertices on the working mesh only")
+            seeds.append(int(index[:-1]))
+        fn,_,faces=mesh_data(mesh)
+        protected.update(protected_band(fn.numVertices,faces,seeds,self.value("fit_band")))
+        with transaction("CW protect fit vertices"):
+            string_attr(mesh,"cwFitProtected",json.dumps(sorted(protected)))
+        self.log("Protected %d vertices from surface refinement." % len(protected))
+
+    def select_protected(self):
+        mesh=self.target(); vertices=self.fit_protected(mesh)
+        cmds.select([mesh+".vtx[%d]" % i for i in vertices],replace=True)
+
+    def refine_human(self):
+        require_fit_units()
+        mesh_fn,_,_,snapshot,transaction,string_attr=helpers()
+        mesh=self.target(); protected=self.fit_protected(mesh)
+        sourcefn=mesh_fn(self.source())
+        fn,points,_=mesh_data(mesh)
+        normals=fn.getVertexNormals(True,om.MSpace.kWorld)
+        box=cmds.exactWorldBoundingBox(mesh)
+        step=(box[4]-box[1])*self.value("fit_distance","float")/100
+        if step<=0: raise ValueError("Working mesh has no height")
+        skipped=set()
+        for _ in range(self.value("fit_steps")):
+            for i,p in enumerate(points):
+                if i in protected: continue
+                closest,normal,_=sourcefn.getClosestPointAndNormal(om.MPoint(*p),om.MSpace.kWorld)
+                goal=[closest.x,closest.y,closest.z]
+                if distance(p,goal)>step*10 or normals[i]*normal<.25:
+                    skipped.add(i); continue
+                points[i]=bounded_step(p,goal,step)
+        with transaction("CW bounded human fit"):
+            result=snapshot(mesh,"_refined")
+            write_world_points(result,points)
+            string_attr(result,"cwReadiness","UNREVIEWED_FIT")
+        self.remember(result,"target"); cmds.select(result)
+        self.log("Refined copy; %d protected, %d distant/opposite-facing vertices skipped. Check openings and intersections." % (len(protected),len(skipped)))
+
+    def check_human(self):
+        mesh=self.target(); protected=self.fit_protected(mesh)
+        _,points,faces=mesh_data(mesh)
+        _,original,template_faces=mesh_data(self.resolve("template"))
+        same=faces==template_faces and len(points)==len(original)
+        ratios=[]
+        if same:
+            edges={tuple(sorted((a,face[(i+1)%len(face)]))) for face in faces for i,a in enumerate(face)}
+            for a,b in edges:
+                base=distance(original[a],original[b])
+                if base>1e-10: ratios.append(distance(points[a],points[b])/base)
+        report=geometry_report(mesh)
+        report.update(template_connectivity_preserved=same,protected_vertices=len(protected),
+                      edge_scale_min=min(ratios) if ratios else None,edge_scale_max=max(ratios) if ratios else None,
+                      readiness="REQUIRES_DEFORMATION_REVIEW",self_intersections="NOT_TESTED",
+                      required_review=["blink/lid contact","lip closure","jaw opening","smile/pucker","shoulder/hip bends","elbow/knee compression","finger curl"])
+        self.last_report=report; self.log(json.dumps(report,indent=2))
+
+    def build_loop_patch(self,feature):
+        require_fit_units()
+        _,_,_,_,transaction,string_attr=helpers()
+        # SOURCE-only captures are enough; no template asset is needed for this helper.
+        fn,_,_=mesh_data(self.source())
+        sourcepoints=fn.getPoints(om.MSpace.kWorld)
+        sig=signature(self.source())
+        keys=([feature+"_outer",feature+"_inner",feature+"_upper",feature+"_lower"]
+              if feature.startswith("eye") else ["mouth_L","mouth_R","mouth_upper","mouth_lower"])
+        points=[]
+        for key in keys:
+            entry=self.fit_pairs.get(key,{}).get("source")
+            if not entry or entry["uuid"]!=self.source_uuid or entry["signature"]!=sig:
+                raise ValueError("Capture SOURCE landmark "+key+" first")
+            p=sourcepoints[entry["index"]]; points.append([p.x,p.y,p.z])
+        # Order world-X endpoints to give the same face orientation on both eyes.
+        if points[0][0]>points[1][0]: points[0],points[1]=points[1],points[0]
+        verts,faces=loop_patch(*points,segments=self.value("patch_segments"),rings=self.value("patch_rings"))
+        with transaction("CW original facial loop patch"):
+            # polyCreateFacet creates undoable geometry; polyUnite merges construction
+            # pieces and polyMergeVertex welds only coincident points at tiny tolerance.
+            pieces=[cmds.polyCreateFacet(point=[verts[v] for v in face],constructionHistory=False)[0] for face in faces]
+            patch=cmds.polyUnite(pieces,constructionHistory=False,name="CW_"+feature+"_LOOP_PATCH#")[0]
+            cmds.polyMergeVertex(patch+".vtx[*]",distance=1e-8,alwaysMergeTwoVertices=False,constructionHistory=False)
+            string_attr(patch,"cwReadiness","OPEN_CONSTRUCTION_PATCH_NOT_COMPLETE_FACE")
+        cmds.select(patch)
+        self.log("Original open loop patch created. Join/refine it into a complete face; it is not the active working output.")
+
+
+# ============================================================================
+# SECTION: creature_workbench.py
+# ============================================================================
+"""Creature Workbench 1.0 -- Maya Python 3, native cmds UI.
+
+Single-file edition: run this complete file in Maya.
+No third-party package is required. See README.md for scope and validation.
+"""
+import functools
+import importlib.util
+import json
+import math
+import os
+import traceback
+import uuid
+import webbrowser
+from contextlib import contextmanager
+
+import maya.cmds as cmds
+import maya.mel as mel
+import maya.api.OpenMaya as om
+
+VERSION = "1.1.0"
+WINDOW = "creatureWorkbenchWindow"
+INSTANCE = None
+
+
+def shape_of(mesh):
+    if not cmds.objExists(mesh):
+        raise ValueError("Object no longer exists: " + mesh)
+    if cmds.nodeType(mesh) == "mesh":
+        return cmds.ls(mesh, long=True)[0]
+    shapes = cmds.listRelatives(mesh, shapes=True, noIntermediate=True, fullPath=True, type="mesh") or []
+    if len(shapes) != 1:
+        raise ValueError("Choose a transform containing exactly one polygon mesh")
+    return shapes[0]
+
+
+def mesh_fn(mesh):
+    selection = om.MSelectionList()
+    selection.add(shape_of(mesh))
+    return om.MFnMesh(selection.getDagPath(0))
+
+
+def selected_mesh():
+    selected = cmds.ls(selection=True, objectsOnly=True, long=True) or []
+    selected = list(dict.fromkeys(selected))
+    if len(selected) != 1:
+        raise ValueError("Select exactly one mesh")
+    shape = shape_of(selected[0])
+    return cmds.listRelatives(shape, parent=True, fullPath=True)[0]
+
+
+def skin_of(mesh):
+    skins = cmds.ls(cmds.listHistory(shape_of(mesh)) or [], type="skinCluster") or []
+    if len(skins) > 1:
+        raise ValueError("Multiple skinClusters found; choose a mesh with one skinCluster")
+    return skins[0] if skins else None
+
+
+def string_attr(node, name, value):
+    if not cmds.attributeQuery(name, node=node, exists=True):
+        cmds.addAttr(node, longName=name, dataType="string")
+    cmds.setAttr(node+"."+name, value, type="string")
+
+
+@contextmanager
+def transaction(name):
+    """Rollback only this chunk; marker guarantees there is an undoable action."""
+    if not cmds.undoInfo(query=True, state=True):
+        raise RuntimeError("Enable Maya Undo before running scene operations")
+    selection = cmds.ls(selection=True, long=True) or []
+    cmds.undoInfo(openChunk=True, chunkName=name)
+    marker = cmds.createNode("network", name="CW_transaction#")
+    try:
+        yield
+        cmds.delete(marker)
+    except Exception:
+        cmds.undoInfo(closeChunk=True)
+        cmds.undo()
+        existing = [item for item in selection if cmds.objExists(item)]
+        if existing:
+            cmds.select(existing, replace=True)
+        raise
+    else:
+        cmds.undoInfo(closeChunk=True)
+
+
+def snapshot(mesh, suffix):
+    """Duplicate evaluated geometry only; never copy source hierarchy or deformers."""
+    if cmds.listRelatives(mesh, children=True, type="transform"):
+        raise ValueError("Use a mesh transform without child transforms")
+    result = cmds.duplicate(mesh, returnRootsOnly=True, inputConnections=False,
+                            upstreamNodes=False, name=safe_name(mesh.split("|")[-1])+suffix)[0]
+    if cmds.listRelatives(result, parent=True):
+        result = cmds.parent(result, world=True)[0]
+    cmds.delete(result, constructionHistory=True)
+    for shape in cmds.listRelatives(result, shapes=True, fullPath=True) or []:
+        if cmds.getAttr(shape+".intermediateObject"):
+            cmds.delete(shape)
+    for attr in ("tx","ty","tz","rx","ry","rz","sx","sy","sz","v"):
+        cmds.setAttr(result+"."+attr, lock=False)
+    cmds.setAttr(result+".visibility", True)
+    string_attr(result, "cwSource", mesh)
+    return cmds.ls(result, long=True)[0]
+
+
+def geometry_report(mesh):
+    fn = mesh_fn(mesh)
+    path = fn.dagPath()
+    counts, _ = fn.getVertices()
+    edges = om.MItMeshEdge(path)
+    boundaries = 0
+    while not edges.isDone():
+        boundaries += int(edges.onBoundary())
+        edges.next()
+    faces = om.MItMeshPolygon(path)
+    degenerate = []
+    while not faces.isDone():
+        if faces.getArea(om.MSpace.kWorld) <= 1e-12:
+            degenerate.append(faces.index())
+        faces.next()
+    nm_e = cmds.polyInfo(mesh, nonManifoldEdges=True) or []
+    nm_v = cmds.polyInfo(mesh, nonManifoldVertices=True) or []
+    lamina = cmds.polyInfo(mesh, laminaFaces=True) or []
+    return dict(mesh=mesh, vertices=fn.numVertices, edges=fn.numEdges, faces=fn.numPolygons,
+                quad_percent=round(100*sum(c == 4 for c in counts)/max(1,len(counts)),2),
+                triangles=sum(c == 3 for c in counts), ngons=sum(c > 4 for c in counts),
+                boundary_edges=boundaries, nonmanifold_edges=len(nm_e),
+                nonmanifold_vertices=len(nm_v), lamina_faces=len(lamina),
+                zero_area_faces=len(degenerate), uv_sets=fn.getUVSetNames(),
+                skin=skin_of(mesh), units=cmds.currentUnit(query=True, linear=True),
+                note="Boundary edges can be intentional. Counts do not certify animation edge flow.")
+
+
+def uv_report(mesh):
+    fn = mesh_fn(mesh)
+    uvset = fn.currentUVSetName()
+    us, vs = fn.getUVs(uvset)
+    if not us:
+        raise ValueError("No UV coordinates in current UV set")
+    missing, flipped, zero, ratios = [], [], [], []
+    faces = om.MItMeshPolygon(fn.dagPath())
+    while not faces.isDone():
+        idx = faces.index()
+        try:
+            u, v = faces.getUVs(uvset)
+            area = uv_area(list(zip(u,v)))
+            world = faces.getArea(om.MSpace.kWorld)
+            if area < -1e-12:
+                flipped.append(idx)
+            if abs(area) < 1e-12:
+                zero.append(idx)
+            if world > 1e-12:
+                ratios.append(abs(area)/world)
+        except RuntimeError:
+            missing.append(idx)
+        faces.next()
+    ratios.sort()
+    median = ratios[len(ratios)//2] if ratios else 0
+    spread = (ratios[int((len(ratios)-1)*.95)]/max(1e-15,ratios[int((len(ratios)-1)*.05)])) if ratios else None
+    return dict(mesh=mesh, uv_set=uvset, uv_count=len(us),
+                missing_uv_faces=len(missing), negative_signed_uv_faces=len(flipped),
+                zero_area_uv_faces=len(zero), uv_bounds=[min(us),min(vs),max(us),max(vs)],
+                area_density_p95_over_p05=spread, median_uv_area_per_world_area=median,
+                note="Area-density spread is not angular stretch. Negative UV orientation may be deliberate. Use UV Editor overlap selection for overlap testing.")
+
+
+class Workbench(HumanRetopology):
+    def __init__(self):
+        self.ui = {}
+        self.source_uuid = None
+        self.target_uuid = None
+        self.guide_uuid = None
+        self.rig_uuid = None
+        self.template_uuid = None
+        self.fit_pairs = {}
+        self.help_catalog = {}
+        self.pending_help = PAGES["Start here"]
+        self.current_page = "Start here"
+        self.tab_names = []
+        self.last_report = {}
+        self.log_lines = []
+
+    def log(self, message):
+        line = str(message)
+        self.log_lines.append(line)
+        print("[Creature Workbench] " + line)
+        if self.ui.get("log") and cmds.scrollField(self.ui["log"], exists=True):
+            cmds.scrollField(self.ui["log"], edit=True, text="\n".join(self.log_lines[-180:]))
+
+    def callback(self, func):
+        @functools.wraps(func)
+        def wrapped(*unused):
+            try:
+                return func()
+            except Exception as exc:
+                self.log("ERROR: " + str(exc))
+                traceback.print_exc()
+                cmds.warning(str(exc))
+        return wrapped
+
+    def explain(self, message):
+        self.pending_help = message
+        if self.ui.get("help_text"):
+            cmds.scrollField(self.ui["help_text"],edit=True,text=message)
+
+    def button(self, label, func, accent=False, help_text=None):
+        description = help_text or action_text(label,getattr(func,"__name__",""))
+        self.help_catalog[label] = description
+        parent=cmds.setParent(query=True)
+        cmds.rowLayout(numberOfColumns=2,adjustableColumn=1,columnWidth2=(100,34))
+        def run():
+            self.explain(label+"\n"+description)
+            return func()
+        result=cmds.button(label=label,height=32,command=self.callback(run),annotation=description,
+                           backgroundColor=(.18,.37,.39) if accent else (.25,.27,.30))
+        cmds.button(label="?",width=30,height=32,annotation="Explain this action without running it",
+                    command=lambda *_:self.explain(label+"\n"+description))
+        cmds.setParent(parent)
+        return result
+
+    def setting_help(self,key,label,command):
+        description=SETTINGS[key]
+        self.help_catalog[label]=description
+        command(self.ui[key],edit=True,annotation=description+"\nRight-click for explanation in the window.")
+        popup=cmds.popupMenu(parent=self.ui[key],button=3)
+        cmds.menuItem(parent=popup,label="Explain this setting",command=lambda *_:self.explain(label+"\n"+description))
+
+    def text(self, message):
+        cmds.text(label=message, align="left", wordWrap=True, height=max(34, 18*(message.count("\n")+1)))
+
+    def integer(self, key, label, value, minimum, maximum):
+        self.ui[key] = cmds.intSliderGrp(label=label, field=True, value=value,
+                                         minValue=minimum, maxValue=maximum,
+                                         fieldMinValue=minimum, fieldMaxValue=maximum)
+        self.setting_help(key,label,cmds.intSliderGrp)
+
+    def number(self, key, label, value, minimum=0, maximum=1):
+        self.ui[key] = cmds.floatSliderGrp(label=label, field=True, value=value,
+                                           minValue=minimum, maxValue=maximum,
+                                           fieldMinValue=minimum, fieldMaxValue=maximum)
+        self.setting_help(key,label,cmds.floatSliderGrp)
+
+    def check(self, key, label, value=False):
+        self.ui[key] = cmds.checkBox(label=label, value=value)
+        self.setting_help(key,label,cmds.checkBox)
+
+    def menu(self, key, label, options):
+        self.ui[key] = cmds.optionMenu(label=label)
+        for option in options:
+            cmds.menuItem(label=option)
+        self.setting_help(key,label,cmds.optionMenu)
+
+    def value(self, key, kind="int"):
+        control = {"int":cmds.intSliderGrp, "float":cmds.floatSliderGrp,
+                   "bool":cmds.checkBox, "menu":cmds.optionMenu, "text":cmds.textField}[kind]
+        return control(self.ui[key], query=True, **({"text":True} if kind == "text" else {"value":True}))
+
+    def start_tab(self, tabs, title):
+        self.tab_names.append(title)
+        self.current_page=title
+        cmds.setParent(tabs)
+        scroll = cmds.scrollLayout(childResizable=True)
+        cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnAttach=("both",12))
+        self.button("Explain this page: "+title,lambda:self.explain(PAGES[title]),
+                    help_text=PAGES[title])
+        return scroll
+
+    def goto_page(self,title):
+        cmds.tabLayout(self.ui["tabs"],edit=True,selectTabIndex=self.tab_names.index(title)+1)
+        self.explain(PAGES[title])
+
+    def page_changed(self,*_):
+        index=cmds.tabLayout(self.ui["tabs"],query=True,selectTabIndex=True)-1
+        if 0<=index<len(self.tab_names): self.explain(PAGES[self.tab_names[index]])
+
+    def search_help(self,*_):
+        query=cmds.textField(self.ui["help_search"],query=True,text=True).strip().lower()
+        found=[title for title,body in self.help_catalog.items() if query in (title+" "+body).lower()]
+        cmds.textScrollList(self.ui["help_results"],edit=True,removeAll=True)
+        if found: cmds.textScrollList(self.ui["help_results"],edit=True,append=sorted(found))
+
+    def selected_help(self,*_):
+        selected=cmds.textScrollList(self.ui["help_results"],query=True,selectItem=True) or []
+        if selected: self.explain(selected[0]+"\n"+self.help_catalog[selected[0]])
+
+    def show(self):
+        if cmds.window(WINDOW, exists=True):
+            cmds.deleteUI(WINDOW)
+        win = cmds.window(WINDOW, title="CREATURE WORKBENCH  |  Retopo • Rig • UV  |  " + VERSION,
+                          widthHeight=(800,960), sizeable=True)
+        cmds.columnLayout(adjustableColumn=True, rowSpacing=8)
+        self.text("CREATURE WORKBENCH\nGuide-assisted character preparation for Maya / Python 3")
+        cmds.rowLayout(numberOfColumns=2, adjustableColumn=2, columnWidth2=(260,450))
+        self.button("Set source from selection", self.set_source)
+        self.ui["source_label"] = cmds.text(label="Source: not set", align="left")
+        cmds.setParent("..")
+        cmds.rowLayout(numberOfColumns=2, adjustableColumn=2, columnWidth2=(260,450))
+        self.button("Set working mesh", self.set_target)
+        self.ui["target_label"] = cmds.text(label="Working mesh: not set", align="left")
+        cmds.setParent("..")
+        tabs = cmds.tabLayout(innerMarginWidth=8, innerMarginHeight=8, height=470)
+        self.ui["tabs"]=tabs
+        labels = []
+        tab = self.start_tab(tabs,"Start here"); labels.append((tab,"Start here"))
+        self.text("START HERE — your original mesh stays available.\nUse ? beside any button for instructions without running it. Hover/right-click settings for help.")
+        self.text("Source = the sculpt / original shape.\nTemplate = a mesh you own with the loop layout you want.\nWorking mesh = the new result used for UVs, binding and inspection.")
+        self.button("Step 1 — Prepare and check my source",lambda:self.goto_page("Free / Built-in"),True,
+                    help_text="Select your original mesh, Set source, then analyze it and verify the rest pose. This opens the preparation page without changing the scene.")
+        self.button("Step 2 — Human face/body with preserved loops",lambda:self.goto_page("Human topology"),True,
+                    help_text="Opens the guided template-fitting workflow. Requires a compatible topology mesh you own. Existing eye/lip/joint loops are preserved while landmarks change its shape.")
+        self.button("Alternative — Generic remesh for other shapes",lambda:self.goto_page("Retopology"),
+                    help_text="Opens Maya's generic remeshing controls. This is not anatomical face retopology and does not promise animation loops.")
+        self.button("Step 3 — Create my texture layout",lambda:self.goto_page("Automatic UVs"),
+                    help_text="Open the UV page after choosing your working topology. Make UVs before skin binding because this workflow creates an unskinned copy.")
+        self.button("Step 4 — Fit guides and build a basic rig",lambda:self.goto_page("Creature Rig"),
+                    help_text="Open the rig page, create guides and fit them to anatomy. Build a skeleton/control rig, bind, then pose-test. Facial animation controls are not generated.")
+        self.button("Step 5 — Inspect the result",lambda:self.goto_page("Validate / Help"),
+                    help_text="Run numerical checks and inspect expressions/joint bends on your character. A report with no numerical defects is not proof of animation readiness.")
+        tab = self.start_tab(tabs,"Free / Built-in"); labels.append((tab,"Free / Built-in"))
+        self.text("No extra purchase beyond Maya. Start with an undeformed mesh in its intended bind pose.\nMesh operations create outputs; the source is retained.")
+        self.button("Analyze source mesh", lambda:self.analyze(True), True)
+        self.check("rest", "I verified the source is in the intended bind/rest pose", False)
+        self.button("Create clean working snapshot", self.make_working)
+        self.button("Maya retopology settings documentation", lambda:webbrowser.open("https://help.autodesk.com/cloudhelp/2024/ENU/Maya-Modeling/files/GUID-FDE163EE-39C1-421E-AC31-9956D21F6D0F.htm"))
+        self.button("Open UV Editor", lambda:mel.eval("TextureViewWindow;"))
+        self.button("mGear installation / documentation", lambda:webbrowser.open("https://mgear-framework.com/"))
+        self.text("mGear is an optional free rigging framework for advanced component rigs.\nThis tool's own guide rig builder does not require mGear.")
+        self.button("Detect available tools", self.detect)
+
+        tab = self.start_tab(tabs,"Paid / Optional"); labels.append((tab,"Paid / Optional"))
+        self.text("Optional tools are installed and licensed separately.\nVendor interfaces remain responsible for vendor-specific settings and execution.")
+        self.button("Detect installed modules / plug-ins", self.detect, True)
+        self.button("Quad Remesher documentation", lambda:webbrowser.open("https://exoside.com/quadremesher/quadremesher-doc/"))
+        self.text("Quad Remesher: select the prepared working mesh, run its installed vendor shelf button,\nthen select the output and click Set working mesh above. No private engine/SDK calls.")
+        self.button("Select working mesh for vendor tool", lambda:cmds.select(self.target(), replace=True))
+        self.button("Open ngSkinTools 2 (if installed)", self.open_ngskin)
+        self.button("ngSkinTools 2 documentation", lambda:webbrowser.open("https://www.ngskintools.com/documentation/v2/"))
+        self.text("Paid UV applications can use the OBJ round trip below. Import as a separate mesh.\nTopology/order changes may invalidate UV-only or skin transfers; inspect first.")
+        self.button("Export working mesh as OBJ…", self.export_obj)
+        self.button("Import processed OBJ as new objects…", self.import_obj)
+
+        tab = self.start_tab(tabs,"Human topology"); labels.append((tab,"Human topology"))
+        self.human_tab()
+
+        tab = self.start_tab(tabs,"Retopology"); labels.append((tab,"Retopology"))
+        self.text("Native Maya Retopologize. Target counts are approximate.\nNo automatic eye/mouth/joint-loop guarantee; use protected hard edges and Quad Draw refinement.")
+        self.integer("faces","Target faces",8000,100,200000)
+        self.integer("tolerance","Count tolerance %",15,5,50)
+        self.number("regularity","Topology regularity",.5)
+        self.number("uniformity","Face uniformity",0)
+        self.number("anisotropy","Anisotropy",.5)
+        self.check("hard","Preserve hard edges",True)
+        self.check("project","Project result to source surface",False)
+        self.button("Retopologize SOURCE → new working mesh", self.retopo, True)
+        self.text("Selected edges on the WORKING mesh can be hardened as solver guides.\nTo retopologize that edited copy, set it as Source first.")
+        self.button("Harden selected edges (working mesh only)", self.harden_edges)
+        self.button("Make source live for Quad Draw", lambda:cmds.makeLive(self.source()))
+        self.button("Disable live surface", lambda:cmds.makeLive(none=True))
+        self.button("Project working mesh → new copy", self.project_copy)
+        self.button("Measure sampled surface deviation", self.deviation)
+
+        tab = self.start_tab(tabs,"Creature Rig"); labels.append((tab,"Creature Rig"))
+        self.text("Templates assume Y up, +Z forward, X symmetry. Fit every locator before building.\nBiped arms use a T-pose starting layout; extra limbs are customizable chains.")
+        self.ui["prefix"] = cmds.textField(text="Creature", placeholderText="Rig prefix")
+        self.setting_help("prefix","Rig prefix",cmds.textField)
+        self.menu("species","Body plan",list(PRESETS))
+        self.integer("pairs","Custom leg pairs",4,0,12)
+        self.integer("spine","Spine joints",4,2,16)
+        self.integer("tail","Tail joints",0,0,32)
+        self.integer("digits","Biped digits / hand",0,0,5)
+        self.button("1. Create editable guide locators",self.create_guides,True)
+        self.button("Use selected guide group",self.use_guides)
+        self.button("Mirror guide positions L → R",self.mirror_guides)
+        self.integer("chain_count","Extra chain joints",4,2,16)
+        self.button("Add chain from selected guide (wing/tentacle/etc.)",self.add_chain)
+        self.menu("rigmode","Limb controls",["FK everywhere","IK legs + FK body"])
+        self.button("2. Build skeleton + controls from fitted guides",self.build_rig,True)
+        self.button("Use selected generated rig group",self.use_rig)
+        self.integer("influences","Maximum skin influences",4,1,8)
+        self.menu("skinmethod","Skinning",["Classic linear","Dual quaternion"])
+        self.button("3. Bind WORKING mesh to generated rig",self.bind_rig)
+        self.button("Transfer existing SOURCE skin → WORKING mesh",self.transfer_skin)
+        self.button("Select generated controls",self.select_controls)
+        self.button("Export fitted guides JSON…",self.export_guides)
+        self.button("Import fitted guides JSON…",self.import_guides)
+
+        tab = self.start_tab(tabs,"Automatic UVs"); labels.append((tab,"Automatic UVs"))
+        self.text("Creates an UNSKINNED working copy and UV set: run before binding.\nExisting seams + Unfold3D is preferred for a fitted organic layout; automatic projection fragments shells.")
+        self.menu("uvmode","Starting layout",["Automatic projection","Keep existing seams / UVs"])
+        self.menu("planes","Projection planes",["6","4","5","8","12"])
+        self.menu("unwrap","Unfold solver",["Unfold3D (installed plug-in)","Legacy Maya unfold","Pack only"])
+        self.integer("iterations","Legacy iterations",100,10,1000)
+        self.number("padding","Layout spacing %",.5,0,5)
+        self.menu("rotation","Shell rotation",["Free","90 degrees","None"])
+        self.integer("tile","UDIM destination",1001,1001,1100)
+        self.button("Generate UVs → new working copy",self.uvs,True)
+        self.button("Cut selected working-mesh UV seam edges",self.cut_seams)
+        self.button("Analyze current UV set",self.analyze_uv)
+        self.button("Open UV Editor for overlap / checker inspection",lambda:mel.eval("TextureViewWindow;"))
+        self.text("One destination tile per run. Spacing is Maya's percentage control, not guaranteed pixels.\nNo multi-tile optimizer or automatic anatomical seam classifier is claimed.")
+
+        tab = self.start_tab(tabs,"Validate / Help"); labels.append((tab,"Validate / Help"))
+        self.text("Search explanations for every action and setting.\nSelect a result to read it in the Help panel below.")
+        self.ui["help_search"]=cmds.textField(placeholderText="Search: eyelids, skin, source, spacing…",changeCommand=self.search_help,
+                                             annotation="Type a word and press Enter to search all action/setting explanations.")
+        self.ui["help_results"]=cmds.textScrollList(height=100,selectCommand=self.selected_help,
+                                                   annotation="Choose an entry to read its explanation below the tabs.")
+        self.button("Analyze working mesh",lambda:self.analyze(False),True)
+        self.button("Analyze UVs",self.analyze_uv)
+        self.button("Audit skin weights",self.audit_skin)
+        self.button("Compare source / working surface",self.deviation)
+        self.button("Save last report JSON…",self.save_report)
+        self.button("Save session settings JSON…",self.save_settings)
+        self.button("Load session settings JSON…",self.load_settings)
+        self.text("Workflow: Analyze → Retopo → inspect/refine loops → UV → fit guides → rig → bind → pose tests.\nExisting rigs: verify rest pose → retopo → transfer weights → test original animation.\nTopology changes do not preserve blendshape deltas or old component selections.")
+        self.text("Important: native solvers can block Maya's main thread. Save the scene first.\nOperations are undo-chunked; failures attempt to roll back that operation.\nThis release has automated pure-Python tests; Maya runtime testing is still required.")
+        cmds.tabLayout(tabs, edit=True, tabLabel=labels,changeCommand=self.page_changed,selectTabIndex=1)
+        cmds.setParent(tabs); cmds.setParent("..")
+        cmds.text(label="HELP — ? explains an action without running it",align="left")
+        self.ui["help_text"]=cmds.scrollField(editable=False,wordWrap=True,height=125,text=PAGES["Start here"])
+        cmds.text(label="RESULTS / ERRORS",align="left")
+        self.ui["log"] = cmds.scrollField(editable=False, wordWrap=True, height=75,
+                                          text="Ready. Set a source mesh to begin.")
+        cmds.showWindow(win)
+        self.search_help()
+        self.log("Maya " + cmds.about(version=True) + " | Tool " + VERSION)
+
+    def remember(self, node, slot):
+        setattr(self, slot+"_uuid", cmds.ls(node, uuid=True)[0])
+        if slot in ("source","target"):
+            cmds.text(self.ui[slot+"_label"], edit=True, label=slot.title()+": "+node.split("|")[-1])
+
+    def resolve(self, slot):
+        uid = getattr(self,slot+"_uuid")
+        found = cmds.ls(uid, long=True) if uid else []
+        if not found:
+            raise ValueError("Set a valid " + slot + " first")
+        return found[0]
+
+    def source(self):
+        return self.resolve("source")
+
+    def target(self):
+        mesh = self.resolve("target")
+        if self.source_uuid == self.target_uuid:
+            raise ValueError("Working mesh must be a separate copy from Source")
+        return mesh
+
+    def set_source(self):
+        self.remember(selected_mesh(),"source")
+        self.fit_pairs={}
+        self.log("Source set. Re-check the rest-pose checkbox for this source.")
+        cmds.checkBox(self.ui["rest"], edit=True, value=False)
+
+    def set_target(self):
+        mesh = selected_mesh()
+        if cmds.ls(mesh, uuid=True)[0] == self.source_uuid:
+            raise ValueError("Source and working mesh must be different objects")
+        self.remember(mesh,"target")
+
+    def require_rest(self):
+        if not self.value("rest","bool"):
+            raise ValueError("Verify the source bind/rest pose, then tick the checkbox in Free / Built-in")
+
+    def make_working(self):
+        self.require_rest()
+        with transaction("CW snapshot"):
+            result = snapshot(self.source(),"_work")
+        self.remember(result,"target")
+        cmds.select(result)
+        self.log("Created independent working snapshot: "+result)
+
+    def analyze(self, source):
+        self.last_report = geometry_report(self.source() if source else self.target())
+        self.log(json.dumps(self.last_report,indent=2))
+
+    def retopo(self):
+        self.require_rest()
+        source = self.source()
+        report = geometry_report(source)
+        if any(report[k] for k in ("nonmanifold_edges","nonmanifold_vertices","lamina_faces","zero_area_faces")):
+            raise ValueError("Repair non-manifold, lamina and zero-area geometry before retopology. Analyze source for counts.")
+        if not hasattr(cmds,"polyRetopo"):
+            raise RuntimeError("This Maya build does not expose polyRetopo")
+        self.log("Native remesh starting; Maya may be busy until its solver returns.")
+        with transaction("CW retopology"):
+            result = snapshot(source,"_retopo")
+            cmds.select(result,replace=True)
+            nodes = cmds.polyRetopo(result)
+            if isinstance(nodes,str):
+                nodes = [nodes]
+            history = cmds.ls(cmds.listHistory(result) or [],type="polyRetopo") or []
+            node = history[0] if history else next((n for n in (nodes or []) if cmds.nodeType(n)=="polyRetopo"),None)
+            if not node:
+                raise RuntimeError("Retopologize did not create a polyRetopo history node")
+            settings = {"targetFaceCount":self.value("faces"),
+                        "targetFaceCountTolerance":self.value("tolerance"),
+                        "topologyRegularity":self.value("regularity","float"),
+                        "faceUniformity":self.value("uniformity","float"),
+                        "anisotropy":self.value("anisotropy","float"),
+                        "preserveHardEdges":self.value("hard","bool")}
+            for attr,value in settings.items():
+                if not cmds.attributeQuery(attr,node=node,exists=True):
+                    raise RuntimeError("Unsupported retopology attribute: "+attr)
+                cmds.setAttr(node+"."+attr,value)
+            count = cmds.polyEvaluate(result,face=True)
+            if not count:
+                raise RuntimeError("Retopology produced an empty mesh")
+            # Bake only the output so later transfer/projection has stable vertex indices.
+            cmds.delete(result,constructionHistory=True)
+            if self.value("project","bool"):
+                self.project(result,source)
+        self.remember(result,"target")
+        cmds.select(result,replace=True)
+        self.log("Retopology complete: %s faces. Inspect face/joint loops before rigging." % count)
+        self.analyze(False)
+
+    def selected_edges(self):
+        target = self.target()
+        edges = cmds.filterExpand(cmds.ls(selection=True,long=True,flatten=True) or [],selectionMask=32,expand=True) or []
+        if not edges:
+            raise ValueError("Select edges on the working mesh")
+        target_shape = shape_of(target)
+        for edge in edges:
+            if shape_of(edge.split(".")[0]) != target_shape:
+                raise ValueError("All selected edges must belong to the working mesh")
+        return edges
+
+    def harden_edges(self):
+        edges = self.selected_edges()
+        with transaction("CW harden guides"):
+            cmds.polySoftEdge(edges,angle=0,constructionHistory=True)
+        self.log("Edges hardened. Set this working copy as Source before re-running retopology.")
+
+    def project(self,target,source):
+        cmds.transferAttributes(source,target,transferPositions=1,transferNormals=0,
+                                transferUVs=0,transferColors=0,sampleSpace=0,
+                                searchMethod=3,flipUVs=0,colorBorders=1)
+        cmds.delete(target,constructionHistory=True)
+
+    def project_copy(self):
+        with transaction("CW projection"):
+            result = snapshot(self.target(),"_projected")
+            self.project(result,self.source())
+        self.remember(result,"target")
+        cmds.select(result)
+        self.log("Projected copy created. Check thin surfaces, fingers and mouth interiors for wrong-side projection.")
+
+    def deviation(self):
+        src, dst = mesh_fn(self.source()),mesh_fn(self.target())
+        points = dst.getPoints(om.MSpace.kWorld)
+        stride = max(1,math.ceil(len(points)/500))
+        distances = []
+        for i in range(0,len(points),stride):
+            close,_ = src.getClosestPoint(points[i],om.MSpace.kWorld)
+            distances.append((points[i]-close).length())
+        if not distances:
+            raise ValueError("Empty working mesh")
+        self.last_report = dict(samples=len(distances),mean_distance=sum(distances)/len(distances),
+                                max_distance=max(distances),units="cm (Maya API internal units)",
+                                note="One-way sampled vertex-to-surface distance, not a Hausdorff bound or topology quality score.")
+        self.log(json.dumps(self.last_report,indent=2))
+
+    def create_guide_nodes(self,spec,prefix):
+        validate_spec(spec)
+        group = cmds.group(empty=True,name=prefix+"_GUIDES#")
+        string_attr(group,"cwGuideSpec",json.dumps(spec))
+        string_attr(group,"cwPrefix",prefix)
+        size = max(max(e["position"][i] for e in spec)-min(e["position"][i] for e in spec) for i in range(3))*.018
+        for entry in spec:
+            locator = cmds.spaceLocator(name=prefix+"_"+entry["key"]+"_guide#")[0]
+            locator = cmds.parent(locator,group)[0]
+            cmds.xform(locator,worldSpace=True,translation=entry["position"])
+            string_attr(locator,"cwKey",entry["key"])
+            sh = cmds.listRelatives(locator,shapes=True)[0]
+            cmds.setAttr(sh+".localScale",size,size,size)
+            cmds.setAttr(sh+".overrideEnabled",True)
+            cmds.setAttr(sh+".overrideColor",14 if entry["key"].endswith("_L") or "_L_" in entry["key"] else 17)
+        return group
+
+    def create_guides(self):
+        if cmds.upAxis(query=True,axis=True) != "y":
+            raise ValueError("Templates require a Y-up scene; no scene axis changes are made automatically")
+        spec = guide_spec(self.value("species","menu"),cmds.exactWorldBoundingBox(self.target()),
+                          self.value("pairs"),self.value("spine"),self.value("tail"),self.value("digits"))
+        with transaction("CW create guides"):
+            group = self.create_guide_nodes(spec,safe_name(self.value("prefix","text")))
+        self.remember(group,"guide")
+        cmds.select(group)
+        self.log("Guides created. Fit them inside the anatomy; bend knees before IK build.")
+
+    def use_guides(self):
+        node = (cmds.ls(selection=True,long=True) or [None])[0]
+        if not node or not cmds.attributeQuery("cwGuideSpec",node=node,exists=True):
+            raise ValueError("Select a Creature Workbench guide group")
+        self.remember(node,"guide")
+        self.log("Guide group selected: "+node)
+
+    def fitted_spec(self):
+        group = self.resolve("guide")
+        spec = json.loads(cmds.getAttr(group+".cwGuideSpec"))
+        mapping = {}
+        for child in cmds.listRelatives(group,children=True,fullPath=True,type="transform") or []:
+            if cmds.attributeQuery("cwKey",node=child,exists=True):
+                mapping[cmds.getAttr(child+".cwKey")] = child
+        for entry in spec:
+            if entry["key"] not in mapping:
+                raise ValueError("Missing guide: "+entry["key"])
+            entry["position"] = cmds.xform(mapping[entry["key"]],query=True,worldSpace=True,translation=True)
+        validate_spec(spec)
+        return group,spec,mapping
+
+    def mirror_guides(self):
+        group,spec,mapping = self.fitted_spec()
+        root = next(e for e in spec if e["parent"] is None)
+        center = root["position"][0]
+        count = 0
+        with transaction("CW mirror guides"):
+            for entry in spec:
+                key = entry["key"]
+                opposite = key.replace("_L_","_R_")
+                if key.endswith("_L"):
+                    opposite = key[:-2]+"_R"
+                if opposite != key and opposite in mapping:
+                    p = list(entry["position"]); p[0] = 2*center-p[0]
+                    cmds.xform(mapping[opposite],worldSpace=True,translation=p)
+                    count += 1
+        self.log("Mirrored %d guides across the pelvis world-X plane." % count)
+
+    def add_chain(self):
+        group,spec,mapping = self.fitted_spec()
+        selected = cmds.ls(selection=True,long=True) or []
+        reverse = {v:k for k,v in mapping.items()}
+        if len(selected)!=1 or selected[0] not in reverse:
+            raise ValueError("Select one locator in the active guide group")
+        parent = reverse[selected[0]]
+        start = cmds.xform(selected[0],query=True,worldSpace=True,translation=True)
+        prefix = cmds.getAttr(group+".cwPrefix")
+        token = "extra_"+uuid.uuid4().hex[:6]
+        bbox = cmds.exactWorldBoundingBox(self.target())
+        step = max(bbox[i+3]-bbox[i] for i in range(3))*.08
+        with transaction("CW add chain"):
+            for i in range(self.value("chain_count")):
+                key = token+"_%02d" % (i+1)
+                pos = [start[0],start[1],start[2]-(i+1)*step]
+                entry = dict(key=key,parent=parent,position=pos,chain=token,role="fk")
+                spec.append(entry)
+                loc = cmds.spaceLocator(name=prefix+"_"+key+"_guide#")[0]
+                loc = cmds.parent(loc,group)[0]
+                cmds.xform(loc,worldSpace=True,translation=pos)
+                string_attr(loc,"cwKey",key)
+                parent = key
+            string_attr(group,"cwGuideSpec",json.dumps(spec))
+        self.log("Extra chain created; move its locators to fit the appendage.")
+
+    def control(self,name,joint,parent,radius,color):
+        ctrl = cmds.circle(name=name,normal=(1,0,0),radius=radius,constructionHistory=False)[0]
+        offset = cmds.group(ctrl,name=name+"_ZERO")
+        matrix = cmds.xform(joint,query=True,worldSpace=True,matrix=True)
+        cmds.xform(offset,worldSpace=True,matrix=matrix)
+        cmds.parent(offset,parent)
+        shape = cmds.listRelatives(ctrl,shapes=True)[0]
+        cmds.setAttr(shape+".overrideEnabled",True)
+        cmds.setAttr(shape+".overrideColor",color)
+        for attr in ("sx","sy","sz","v"):
+            cmds.setAttr(ctrl+"."+attr,lock=True,keyable=False)
+        return ctrl
+
+    def build_rig(self):
+        group,spec,_ = self.fitted_spec()
+        prefix = cmds.getAttr(group+".cwPrefix")+"_"+uuid.uuid4().hex[:5]
+        positions = {e["key"]:e["position"] for e in spec}
+        for e in spec:
+            if e["parent"] and math.dist(e["position"],positions[e["parent"]]) < 1e-6:
+                raise ValueError("Overlapping guides: "+e["key"])
+        ik = self.value("rigmode","menu").startswith("IK")
+        chains = {}
+        for e in spec:
+            if e["role"].startswith("ik_"):
+                chains.setdefault(e["chain"],{})[e["role"]] = e["key"]
+        radius = max(math.dist(e["position"],spec[0]["position"]) for e in spec)*.055
+        poles = {}
+        if ik:
+            for chain,roles in chains.items():
+                poles[chain] = pole_position(positions[roles["ik_start"]],positions[roles["ik_mid"]],
+                                              positions[roles["ik_end"]],radius*6)
+        with transaction("CW build rig"):
+            rig = cmds.group(empty=True,name=prefix+"_RIG")
+            joints_group = cmds.group(empty=True,name=prefix+"_skeleton",parent=rig)
+            controls_group = cmds.group(empty=True,name=prefix+"_controls",parent=rig)
+            joints,controls = {},{}
+            for e in spec:
+                cmds.select(clear=True)
+                j = cmds.joint(name=prefix+"_"+e["key"]+"_JNT",position=e["position"],radius=radius*.3)
+                j = cmds.parent(j,joints[e["parent"]] if e["parent"] else joints_group)[0]
+                joints[e["key"]] = j
+            # Parent-first orientation preserves child world positions in Maya.
+            for e in spec:
+                j = joints[e["key"]]
+                if cmds.listRelatives(j,children=True,type="joint"):
+                    cmds.joint(j,edit=True,orientJoint="xyz",secondaryAxisOrient="yup",zeroScaleOrient=True)
+                else:
+                    cmds.joint(j,edit=True,orientJoint="none",zeroScaleOrient=True)
+            ikkeys = set()
+            if ik:
+                for roles in chains.values():
+                    ikkeys.update(roles.values())
+            for e in spec:
+                key = e["key"]
+                if key in ikkeys or e["role"] == "end":
+                    continue
+                parentctrl = controls.get(e["parent"],controls_group)
+                ctrl = self.control(prefix+"_"+key+"_CTRL",joints[key],parentctrl,radius,14 if "_L" in key else 13 if "_R" in key else 17)
+                cmds.parentConstraint(ctrl,joints[key],maintainOffset=False)
+                controls[key] = ctrl
+            if ik:
+                for chain,roles in chains.items():
+                    start,mid,end = [joints[roles[r]] for r in ("ik_start","ik_mid","ik_end")]
+                    handle,_ = cmds.ikHandle(name=prefix+"_"+chain+"_IK",startJoint=start,endEffector=end,solver="ikRPsolver")
+                    ctrl = self.control(prefix+"_"+chain+"_IK_CTRL",end,controls_group,radius*1.5,18)
+                    cmds.parent(handle,ctrl)
+                    cmds.setAttr(handle+".visibility",False)
+                    cmds.orientConstraint(ctrl,end,maintainOffset=True)
+                    pole = cmds.circle(name=prefix+"_"+chain+"_POLE_CTRL",radius=radius*.7,constructionHistory=False)[0]
+                    cmds.xform(pole,worldSpace=True,translation=poles[chain])
+                    cmds.parent(pole,controls_group)
+                    cmds.poleVectorConstraint(pole,handle)
+                    controls[chain+"_ik"] = ctrl
+                    controls[chain+"_pole"] = pole
+            string_attr(rig,"cwJoints",json.dumps(list(joints.values())))
+            string_attr(rig,"cwControls",json.dumps(list(controls.values())))
+            string_attr(rig,"cwVersion",VERSION)
+        self.remember(rig,"rig")
+        cmds.select(rig)
+        self.log("Rig built: %d joints, %d controls. FK or IK mode is fixed at build; no FK/IK matching or facial rig." % (len(joints),len(controls)))
+
+    def use_rig(self):
+        selected = cmds.ls(selection=True,long=True) or []
+        if len(selected)!=1 or not cmds.attributeQuery("cwJoints",node=selected[0],exists=True):
+            raise ValueError("Select a generated rig group")
+        self.remember(selected[0],"rig")
+
+    def rig_items(self,attr):
+        items = json.loads(cmds.getAttr(self.resolve("rig")+"."+attr))
+        if not all(cmds.objExists(item) for item in items):
+            raise ValueError("Rig members were renamed/deleted; stored rig membership is invalid")
+        return items
+
+    def bind_rig(self):
+        target = self.target()
+        if skin_of(target):
+            raise ValueError("Working mesh already has skin; existing skin is not overwritten")
+        joints = self.rig_items("cwJoints")
+        with transaction("CW bind"):
+            skin = cmds.skinCluster(joints,target,toSelectedBones=True,bindMethod=0,
+                                    skinMethod=0 if self.value("skinmethod","menu")=="Classic linear" else 1,
+                                    maximumInfluences=self.value("influences"),obeyMaxInfluences=True,
+                                    normalizeWeights=1,name="CW_skin#")[0]
+        self.log("Bound with closest-distance weighting: "+skin+". Pose-test and paint weights before production use.")
+
+    def transfer_skin(self):
+        self.require_rest()
+        src,dst = self.source(),self.target()
+        source_skin = skin_of(src)
+        if not source_skin:
+            raise ValueError("Source has no skinCluster")
+        if skin_of(dst):
+            raise ValueError("Working mesh already has skin; use a new unbound copy")
+        influences = cmds.skinCluster(source_skin,query=True,influence=True)
+        with transaction("CW transfer skin"):
+            skin = cmds.skinCluster(influences,dst,toSelectedBones=True,maximumInfluences=self.value("influences"),
+                                    normalizeWeights=1,skinMethod=cmds.getAttr(source_skin+".skinningMethod"))[0]
+            cmds.copySkinWeights(sourceSkin=source_skin,destinationSkin=skin,noMirror=True,
+                                  surfaceAssociation="closestPoint",influenceAssociation="name",normalize=True)
+        self.log("Copied skin weights onto the same source influences. Original rig connections remain on the source rig.\nBlendshape deltas, per-vertex blend weights and corrective deformers are not transferred. Audit influence count.")
+
+    def select_controls(self):
+        cmds.select(self.rig_items("cwControls"),replace=True)
+
+    def export_guides(self):
+        group,spec,_ = self.fitted_spec()
+        path = self.file_dialog("Export guide template","JSON (*.json)",0)
+        if path:
+            self.write_json(path,dict(version=1,units=cmds.currentUnit(query=True,linear=True),
+                                       prefix=cmds.getAttr(group+".cwPrefix"),guides=spec))
+
+    def import_guides(self):
+        path = self.file_dialog("Import guide template","JSON (*.json)",1)
+        if not path:
+            return
+        with open(path,encoding="utf-8") as stream:
+            data = json.load(stream)
+        if data.get("version") != 1:
+            raise ValueError("Unsupported guide template version")
+        if data.get("units") != cmds.currentUnit(query=True,linear=True):
+            raise ValueError("Guide units differ from scene; convert the template or use matching scene units")
+        spec = data["guides"]
+        if len(spec)>2000:
+            raise ValueError("Guide template exceeds 2000 joints")
+        validate_spec(spec)
+        with transaction("CW import guides"):
+            group = self.create_guide_nodes(spec,safe_name(data.get("prefix","Creature")))
+        self.remember(group,"guide")
+        cmds.select(group)
+
+    def ensure_unfold(self):
+        if hasattr(cmds,"u3dUnfold"):
+            return
+        for plugin in ("Unfold3D","Unfold3D.mll","Unfold3D.bundle","Unfold3D.so"):
+            try:
+                cmds.loadPlugin(plugin,quiet=True)
+                if hasattr(cmds,"u3dUnfold"):
+                    return
+            except RuntimeError:
+                pass
+        raise RuntimeError("Unfold3D is unavailable. Load it in Plug-in Manager or select Legacy Maya unfold explicitly.")
+
+    def uvs(self):
+        target = self.target()
+        solver = self.value("unwrap","menu")
+        if solver.startswith("Unfold3D"):
+            self.ensure_unfold()
+        keep = self.value("uvmode","menu").startswith("Keep")
+        if keep and not mesh_fn(target).numUVs():
+            raise ValueError("Working mesh needs existing UVs for Keep existing seams mode")
+        with transaction("CW UV generation"):
+            result = snapshot(target,"_uv")
+            existing = cmds.polyUVSet(result,query=True,currentUVSet=True)[0]
+            uvset = "CW_UV_"+uuid.uuid4().hex[:6]
+            cmds.polyUVSet(result,create=True,uvSet=uvset)
+            if keep:
+                cmds.polyUVSet(result,copy=True,uvSet=existing,newUVSet=uvset)
+            cmds.polyUVSet(result,currentUVSet=True,uvSet=uvset)
+            if not keep:
+                cmds.polyAutoProjection(result+".f[*]",planes=int(self.value("planes","menu")),
+                                        layoutMethod=0,optimize=1,scaleMode=1,
+                                        percentageSpace=self.value("padding","float"),uvSetName=uvset)
+            cmds.select(result+".map[*]",replace=True)
+            if solver.startswith("Unfold3D"):
+                # Autodesk directs scripts to query help in-host; no undocumented flags assumed.
+                cmds.u3dUnfold(result+".map[*]")
+            elif solver.startswith("Legacy"):
+                cmds.unfold(result+".map[*]",iterations=self.value("iterations"),
+                            stoppingThreshold=.001,pinUvBorder=False,useScale=False)
+            cmds.polyLayoutUV(result+".f[*]",layout=2,layoutMethod=1,
+                              percentageSpace=self.value("padding","float"),
+                              rotateForBestFit={"Free":2,"90 degrees":1,"None":0}[self.value("rotation","menu")],
+                              scale=1,separate=0,flipReversed=False,uvSetName=uvset)
+            tile = self.value("tile")-1001
+            if tile:
+                cmds.polyEditUV(result+".map[*]",relative=True,uValue=tile%10,vValue=tile//10)
+            cmds.delete(result,constructionHistory=True)
+        self.remember(result,"target")
+        cmds.select(result)
+        self.log("UV copy created. This geometry snapshot is unskinned; UV before binding or transfer skin afterward.")
+        self.analyze_uv()
+
+    def cut_seams(self):
+        edges = self.selected_edges()
+        with transaction("CW cut seams"):
+            cmds.polyMapCut(edges,constructionHistory=True)
+        self.log("Selected UV edges cut on the working mesh; run Keep existing seams next.")
+
+    def analyze_uv(self):
+        self.last_report = uv_report(self.target())
+        self.log(json.dumps(self.last_report,indent=2))
+
+    def audit_skin(self):
+        mesh = self.target()
+        skin = skin_of(mesh)
+        if not skin:
+            raise ValueError("Working mesh is not skinned")
+        import maya.api.OpenMayaAnim as oma
+        selection = om.MSelectionList(); selection.add(skin)
+        fn = oma.MFnSkinCluster(selection.getDependNode(0))
+        meshfn = mesh_fn(mesh)
+        compfn = om.MFnSingleIndexedComponent()
+        comp = compfn.create(om.MFn.kMeshVertComponent)
+        compfn.addElements(range(meshfn.numVertices))
+        weights,count = fn.getWeights(meshfn.dagPath(),comp)
+        unweighted,not_normalized,over_limit = [],[],[]
+        limit = self.value("influences")
+        for i in range(meshfn.numVertices):
+            values = weights[i*count:(i+1)*count]
+            total = sum(values)
+            if total < 1e-8: unweighted.append(i)
+            if abs(total-1)>1e-4: not_normalized.append(i)
+            if sum(v>1e-5 for v in values)>limit: over_limit.append(i)
+        self.last_report = dict(mesh=mesh,skin=skin,vertices=meshfn.numVertices,influences=count,
+                                unweighted_count=len(unweighted),unnormalized_count=len(not_normalized),
+                                over_influence_limit_count=len(over_limit),limit=limit,
+                                unweighted_first_100=unweighted[:100],
+                                note="Numerical audit only. Does not measure bending quality, volume loss or weight leakage.")
+        self.log(json.dumps(self.last_report,indent=2))
+
+    def detect(self):
+        modules = cmds.moduleInfo(listModules=True) or []
+        plugins = cmds.pluginInfo(query=True,listPlugins=True) or []
+        optional = {}
+        for name in ("mgear","ngSkinTools2","QuadRemesher"):
+            try:
+                optional[name] = importlib.util.find_spec(name) is not None
+            except (ImportError,ValueError):
+                optional[name] = False
+        self.last_report = dict(maya=cmds.about(version=True),modules=modules,loaded_plugins=plugins,
+                                python_modules=optional,polyRetopo=hasattr(cmds,"polyRetopo"),
+                                note="Detection is not a license check; MEL-only packages may appear only in the module list.")
+        self.log(json.dumps(self.last_report,indent=2))
+
+    def open_ngskin(self):
+        try:
+            import ngSkinTools2
+        except ImportError:
+            raise RuntimeError("Install ngSkinTools 2 for this Maya version first")
+        ngSkinTools2.open_ui()
+
+    def export_obj(self):
+        target = self.target()
+        path = self.file_dialog("Export working OBJ","OBJ (*.obj)",0)
+        if not path: return
+        cmds.loadPlugin("objExport",quiet=True)
+        selected = cmds.ls(selection=True,long=True) or []
+        try:
+            cmds.select(target,replace=True)
+            cmds.file(path,force=True,options="groups=1;ptgroups=1;materials=1;smoothing=1;normals=1",
+                      type="OBJexport",exportSelected=True)
+        finally:
+            cmds.select(selected,replace=True) if selected else cmds.select(clear=True)
+        self.log("Exported "+path)
+
+    def import_obj(self):
+        path = self.file_dialog("Import processed OBJ","OBJ (*.obj)",1)
+        if not path: return
+        with transaction("CW import OBJ"):
+            nodes = cmds.file(path,i=True,type="OBJ",ignoreVersion=True,
+                              namespace="CW_import_"+uuid.uuid4().hex[:5],returnNewNodes=True)
+        meshes = cmds.ls(nodes,type="mesh",long=True) or []
+        if len(meshes)==1:
+            mesh = cmds.listRelatives(meshes[0],parent=True,fullPath=True)[0]
+            self.remember(mesh,"target")
+            cmds.select(mesh)
+        self.log("Imported separate objects; verify scale, topology and UVs. %d mesh shapes." % len(meshes))
+
+    def file_dialog(self,caption,filter_,mode):
+        paths = cmds.fileDialog2(caption=caption,fileFilter=filter_,fileMode=mode,dialogStyle=2)
+        return paths[0] if paths else None
+
+    def write_json(self,path,data):
+        with open(path,"w",encoding="utf-8") as stream:
+            json.dump(data,stream,indent=2,allow_nan=False)
+        self.log("Saved "+path)
+
+    def save_report(self):
+        if not self.last_report: raise ValueError("Run an analysis first")
+        path = self.file_dialog("Save report","JSON (*.json)",0)
+        if path: self.write_json(path,self.last_report)
+
+    def settings_schema(self):
+        return {**{k:"int" for k in ("faces","tolerance","pairs","spine","tail","digits","chain_count","influences","iterations","tile")},
+                **{k:"int" for k in ("fit_steps","fit_band","patch_segments","patch_rings")},
+                **{k:"float" for k in ("regularity","uniformity","anisotropy","padding","fit_distance")},
+                **{k:"bool" for k in ("hard","project")},
+                **{k:"menu" for k in ("species","rigmode","skinmethod","uvmode","planes","unwrap","rotation")},"prefix":"text"}
+
+    def save_settings(self):
+        path = self.file_dialog("Save settings","JSON (*.json)",0)
+        if path: self.write_json(path,{"version":1,"settings":{k:self.value(k,t) for k,t in self.settings_schema().items()}})
+
+    def load_settings(self):
+        path = self.file_dialog("Load settings","JSON (*.json)",1)
+        if not path: return
+        with open(path,encoding="utf-8") as stream: data = json.load(stream)
+        if data.get("version")!=1: raise ValueError("Unsupported settings version")
+        controls = {"int":cmds.intSliderGrp,"float":cmds.floatSliderGrp,"bool":cmds.checkBox,
+                    "menu":cmds.optionMenu,"text":cmds.textField}
+        # Validate all fields before changing the UI; JSON is data, never executed.
+        for key,kind in self.settings_schema().items():
+            if key not in data["settings"]: continue
+            value = data["settings"][key]
+            if kind in ("int","float"):
+                if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value):
+                    raise ValueError("Invalid numeric setting: "+key)
+                lo=controls[kind](self.ui[key],query=True,fieldMinValue=True)
+                hi=controls[kind](self.ui[key],query=True,fieldMaxValue=True)
+                if value<lo or value>hi or (kind=="int" and int(value)!=value):
+                    raise ValueError("Setting outside range: "+key)
+            elif kind=="bool" and not isinstance(value,bool): raise ValueError("Invalid boolean: "+key)
+            elif kind in ("menu","text") and not isinstance(value,str): raise ValueError("Invalid text: "+key)
+            if kind=="menu":
+                options = cmds.optionMenu(self.ui[key],query=True,itemListLong=True) or []
+                if value not in [cmds.menuItem(item,query=True,label=True) for item in options]:
+                    raise ValueError("Unknown menu choice: "+key)
+        for key,kind in self.settings_schema().items():
+            if key in data["settings"]:
+                controls[kind](self.ui[key],edit=True,**({"text":data["settings"][key]} if kind=="text" else {"value":data["settings"][key]}))
+        self.log("Settings loaded; rest-pose verification and scene-object assignments are not imported.")
+
+
+def show():
+    global INSTANCE
+    INSTANCE = Workbench()
+    INSTANCE.show()
+    return INSTANCE
+
+
+
+
+# Maya drag-and-drop and Script Editor entry points.
+def onMayaDroppedPythonFile(*args):
+    return show()
+
+
+if __name__ == "__main__":
+    show()
